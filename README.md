@@ -45,9 +45,79 @@ $ sudo ./kavsshvpn -s \
 	-x "secretkeypass"
 ```
 
+## Build
+
+Prepare new empty cloud server with Ubuntu 22.04 for build and run kavsshvpn
+as Real-IP server.
+
+```bash
+
+$ sudo apt update && sudo apt upgrade
+$ reboot
+
+$ sudo apt install -y iptables
+$ sudo apt install -y build-essential
+$ sudo apt install -y git
+$ sudo apt install -y pkg-config libssh2-1-dev
+```
+
+Clone and build:
+```bash
+$ git clone https://github.com/KuzinAndrey/kavsshvpn.git
+$ cd kavsshvpn
+$ ./build prod
+$ cp ./kavsshvpn /bin/kavsshvpn
+```
+
 ## TODO
 
 - [ ] - option for retry reconnect after any fail
 - [ ] - option for additional subnets routes in lAN
 - [ ] - make connection as default route all traffic into LAN
 - [ ] - hide private key password in 'ps aux'
+
+## Useful links
+
+- [libssh2](https://github.com/libssh2/libssh2) - SSH2 library
+- [openvpn-install](https://github.com/Nyr/openvpn-install) - OpenVPN road warrior installer for Ubuntu, Debian, AlmaLinux, Rocky Linux, CentOS and Fedora.
+- [wireguard-install](https://github.com/Nyr/wireguard-install) - WireGuard road warrior installer for Ubuntu, Debian, AlmaLinux, Rocky Linux, CentOS and Fedora.
+
+## Some common SSH problems with old libssh2 versions
+
+1. Old libssh2 client library 1.8.0 on Linux Mint 20.1 make authentication via ssh-rsa and get error:
+
+```
+Can't make ssh handshake - -5.
+libssh2 error: -5 - Unable to exchange encryption keys
+```
+In remote server logs by `journalctl -f` get some errors:
+```
+Apr 21 16:44:15 host.example.com sshd[4046]: Unable to negotiate with XXX.XXX.XXX.XXX port 39442: no matching host key type found. Their offer: ssh-rsa,ssh-dss [preauth]
+```
+Solve problem with add to /etc/ssh/sshd_config on SSH server:
+```
+PubkeyAuthentication yes
+HostKeyAlgorithms +ssh-rsa
+PubkeyAcceptedKeyTypes=+ssh-rsa
+```
+And restart the sshd daemon by command:
+```
+$ sudo systemctl restart sshd
+```
+
+2. Wrong format of public/private key file
+
+New key files identifies as `-----BEGIN OPENSSH PRIVATE KEY-----` instead of the older keys identified
+as `-----BEGIN RSA PRIVATE KEY-----`. In older version of libssh2 1.8.0 we can get an error:
+```
+Auth as "root" by public key: /home/user/.ssh/id_rsa.pub
+Auth by public key failed.
+libssh2 error: -19 - Callback returned error
+Close ssh socket #4
+```
+TO solve this problem we need to generate new private/public key file in PEM format by run command:
+```
+$ ssh-keygen -m PEM -t rsa -f /home/user/.ssh/id_rsa_pem
+```
+And save this new public key on server by `ssh-copy-id` or manually in `~/.ssh/authorized_keys` file.
+
