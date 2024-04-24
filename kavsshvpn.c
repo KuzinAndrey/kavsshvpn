@@ -1,3 +1,31 @@
+//
+// kavsshvpn - SSH based tun reverse VPN
+//
+// Author: kuzinandrey@yandex.ru
+//
+// URL: https://www.github.com/KuzinAndrey/kavsshvpn
+//
+// Dependency:
+//    libssh2 - library for SSH communication
+//
+// Build:
+//    LIBSSH2=$(pkg-config libssh2 --cflags --libs)
+//    gcc -Wall -s -DPRODUCTION=1 -pedantic kavsshvpn.c $LIBSSH2 -o kavsshvpn
+//
+// Run:
+//    sudo ./kavsshvpn -r -s -n 10.254.254.0 -H 111.110.11.22 \
+//        -a /home/user/.ssh/id_rsa.pub \
+//        -b /home/user/.ssh/id_rsa \
+//        -x "secretprikeypass"
+//
+// History:
+//   2024-04-21 - Initial version
+//   2024-04-24 - Refactor code from multithreaded style,
+//      because at high traffic buffer overflow occured
+//      in SSH library and rise assert with SIGABRT.
+//      Who use assert() in library code?! You are crazy?
+//
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,7 +38,6 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <pthread.h>
 
 #include <net/if.h>
 #include <linux/if_tun.h>
@@ -76,24 +103,6 @@ int down_tun_iface(struct tun_connection *conn) {
 	}
 	return ret;
 } // down_tun_iface()
-
-///////////////////////////////////////////////////////
-//////// TIMEOUT READ/WRITE
-///////////////////////////////////////////////////////
-ssize_t timeoutread(int t, int fd, char *buf, size_t len)
-{
-	fd_set rfds;
-	struct timeval tv;
-	tv.tv_sec = t;
-	tv.tv_usec = 100000;
-	FD_ZERO(&rfds);
-	FD_SET(fd,&rfds);
-	if (select(fd + 1, &rfds, NULL, NULL, &tv) == -1) return -1;
-	if (FD_ISSET(fd, &rfds))
-		return read(fd, buf, len);
-	errno = 0;
-	return 0;
-} // timeoutread()
 
 ///////////////////////////////////////////////////////
 //////// SSH
@@ -190,7 +199,7 @@ int up_ssh_session(struct ssh_session *sess) {
 	}
 
 	libssh2_session_set_blocking(sess->session, 0); // non-blocking mode
-//	libssh2_keepalive_config(sess->session, 1, 15);
+	libssh2_keepalive_config(sess->session, 1, 30);
 
 	while ((rc = libssh2_session_handshake(sess->session, sess->sock)) ==
 		LIBSSH2_ERROR_EAGAIN);
@@ -270,7 +279,7 @@ void clean_ssh_channel(struct ssh_session *sess) {
 
 //	if (rc == 0) {
 //		exitcode = libssh2_channel_get_exit_status(sess->channel);
-//		// TODO
+//		// TODO ?
 //	}
 
 	libssh2_channel_free(sess->channel);
@@ -316,12 +325,9 @@ int run_command(const char *fmt, ...) {
 	printf(" = %d\n", comret);
 	if (comret == -1) {
 		fprintf(stderr, "Can't run command: \"%s\" - %s\n", com, strerror(errno));
-		goto defer;
 	} else if (comret != 0) {
 		fprintf(stderr, "Command \"%s\" return not zero code %d\n", com, comret);
-		goto defer;
-	}
-	ret = comret;
+	} else ret = comret;
 defer:
 	if (com) free(com);
 	return ret;
@@ -355,6 +361,7 @@ char *opt_ssh_privkey = NULL;
 char *opt_ssh_pubkey = NULL;
 char *opt_ssh_keypass = NULL;
 
+int opt_foreground = 0;
 int opt_server_permanent = 0;
 
 const char *session_start_sign = "ReAdy-SeT-Go!\n";
@@ -367,190 +374,248 @@ char *channel_buffer = NULL;
 size_t channel_buffer_size = 32 << 10;
 
 ///////////////////////////////////////////////////////
-//////// THREADS
+// CLIENT/SERVER WORK
 ///////////////////////////////////////////////////////
-pthread_t pth[2] = {0};
 
-void *thread_client_read_tun(void *data) {
+void client_work(struct tun_connection *conn) {
+	int rc;
+
 	ssize_t n;
 	size_t packet_size;
 	size_t pos;
 
-	while (program_state == 0) {};
+	int channel_state = 0; // 0 - read packet size, 1 - read packet
+	size_t channel_packet_size = 0;
+	size_t channel_state_pos = 0;
 
-	// send SIGN to server detect session start
-	printf("%s", session_start_sign);
+	// we need send info about packet length in ssh stream (reserve at buffer start size_t space)
+	char *adj_buffer = tun_buffer + sizeof(packet_size);
+	size_t adj_buffer_size = tun_buffer_size - sizeof(packet_size);
+
+	fd_set rfds;
+	struct timeval tv;
+
+	// send SIGN to server for detect session start
+	fprintf(stdout, "%s", session_start_sign);
 	fflush(stdout);
 
-	while (program_state == 1) {
-		n = timeoutread(1, tc.tun_fd, tun_buffer + sizeof(packet_size),
-			tun_buffer_size - sizeof(packet_size));
-		if (n == 0) continue;
-		if (n < 0) { program_state = 2; break; }
+	while (1) {
+		// READ FROM TUN
+		FD_ZERO(&rfds);
+		FD_SET(conn->tun_fd,&rfds);
+		tv.tv_sec = 0; tv.tv_usec = 1000;
+		rc = select((conn->tun_fd + 1), &rfds, NULL, NULL, &tv);
+		if ( -1 == rc ) return;
+		if (rc && FD_ISSET(conn->tun_fd, &rfds)) {
+			n = read(conn->tun_fd, adj_buffer, adj_buffer_size);
+			if (n <= 0) {
+				return;
+			}
 
-		pos = htonl(n);
-		memcpy(tun_buffer, &pos, sizeof(size_t));
+			// save info about packet size
+			pos = htonl(n);
+			memcpy(tun_buffer, &pos, sizeof(size_t));
 
-		packet_size = n + sizeof(pos);
+			pos = 0;
+			packet_size = n + sizeof(pos); // packet size for write to ssh channel
 
-//		pos = fwrite(tun_buffer, 1, packet_size, stdout);
-//		if (pos < packet_size) { program_state = 2; break; }
-//		fflush(stdout);
+			pos = fwrite(tun_buffer, 1, packet_size, stdout);
+			if (pos < packet_size) return;
+			fflush(stdout);
+		} // if tun can read
 
-		pos = 0;
-		do {
-			if (program_state != 1) break;
-			if ((n = write(STDOUT_FILENO, tun_buffer + pos, packet_size - pos)) < 0) {
-				if ( errno == EINTR || errno == EAGAIN ) continue;
-				break;
-			};
-			pos += n;
-		} while (packet_size - pos > 0);
-		if (n < 0) { program_state = 2; break; }
-	} // while
+		// READ FROM STDIN
+		if (channel_state == 0) { // read packet size
+			FD_ZERO(&rfds);
+			FD_SET(STDIN_FILENO,&rfds);
+			tv.tv_sec = 0; tv.tv_usec = 1000;
+			rc = select((STDIN_FILENO + 1), &rfds, NULL, NULL, &tv);
+			if ( -1 == rc ) return;
+			if (rc && FD_ISSET(STDIN_FILENO, &rfds)) {
+				n = read(STDIN_FILENO, (char *)&channel_packet_size + channel_state_pos,
+					sizeof(channel_packet_size) - channel_state_pos);
+				if (n <= 0) {
+					return;
+				}
+				channel_state_pos += n;
 
-	pthread_exit(NULL);
-} // thread_client_read_tun()
-
-void *thread_client_read_ssh(void *data) {
-	ssize_t n;
-	size_t packet_size;
-	size_t pos;
-
-	while (program_state == 0) {};
-	while (program_state == 1) {
-		n = timeoutread(1, STDIN_FILENO,
-			(char *)&packet_size, sizeof(packet_size));
-		if (n == 0) continue;
-		if (n < 0) { program_state = 2; break; }
-
-		packet_size = ntohl(packet_size);
-
-		if (packet_size > channel_buffer_size) {
-			char *r = realloc(channel_buffer, packet_size);
-			if (!r) { program_state = 2; break; }
-			channel_buffer = r;
-			channel_buffer_size = packet_size;
+				if (channel_state_pos == sizeof(channel_packet_size)) {
+					channel_state = 1; // read packet
+					channel_state_pos = 0;
+					channel_packet_size = ntohl(channel_packet_size);
+					// adjust buffer size
+					if (channel_packet_size > channel_buffer_size) {
+						char *r = realloc(channel_buffer, channel_packet_size);
+						if (!r) {
+							// TODO no memory log
+							return;
+						}
+						channel_buffer = r;
+						channel_buffer_size = channel_packet_size;
+					}
+				}
+			} // if can read
 		}
 
-		pos = 0;
-		do {
-			if (program_state != 1) break;
-			n = timeoutread(1, STDIN_FILENO,
-				channel_buffer + pos, packet_size - pos);
-			if (n == 0) continue;
-			else if (n < 0) { program_state = 2; break; }
-			pos += n;
-		} while (packet_size - pos > 0);
-		if (n < 0) { program_state = 2; break; }
-
-		do {
-			if (program_state != 1) break;
-			if ((n = write(tc.tun_fd, channel_buffer, packet_size)) < 0) {
-				if ( errno == EINTR || errno == EAGAIN ) continue;
-				break;
-			} else break;
-		} while (1);
-		if (n < 0) { program_state = 2; break; }
-	} // while
-
-	pthread_exit(NULL);
-} // thread_client_read_ssh()
-
-void *thread_server_read_tun(void *data) {
-	ssize_t n;
-	size_t packet_size;
-	size_t pos;
-
-	while (program_state == 0) {};
-	while (program_state == 1) {
-		n = timeoutread(1, tc.tun_fd, tun_buffer + sizeof(packet_size),
-			tun_buffer_size - sizeof(packet_size));
-		if (n == 0) continue;
-		if (n < 0) { program_state = 2; break; }
-
-		pos = htonl(n);
-		memcpy(tun_buffer, &pos, sizeof(size_t));
-
-		packet_size = n + sizeof(pos);
-		pos = 0;
-		do {
-			if (program_state != 1) break;
-			n = libssh2_channel_write(sshconn.channel,
-				tun_buffer + pos, packet_size - pos);
-			if (n == LIBSSH2_ERROR_EAGAIN) {
-				if (-1 == ssh_waitsocket(sshconn.sock, sshconn.session)) break;
-				continue;
-			} else if (n < 0) break;
-			pos += n;
-		} while (packet_size - pos > 0);
-		if (n < 0) { program_state = 2; break; }
-	} // while
-
-	pthread_exit(NULL);
-} // thread_server_read_tun()
-
-void *thread_server_read_ssh(void *data) {
-	ssize_t n;
-	size_t packet_size;
-	size_t pos;
-
-	while (program_state == 0) {};
-
-	while (program_state == 1) {
-		pos = 0;
-		do {
-			if (program_state != 1) break;
-			n = libssh2_channel_read(sshconn.channel,
-				(char *)(&packet_size + pos), sizeof(packet_size) - pos);
-			if (n == LIBSSH2_ERROR_EAGAIN) {
-				if (-1 == ssh_waitsocket(sshconn.sock, sshconn.session)) break;
-				continue;
-			} else if (n < 0) break;
-			pos += n;
-		} while (sizeof(packet_size) - pos > 0);
-		if (n < 0) { program_state = 2; break; }
-		if (program_state != 1) break;
-
-		packet_size = ntohl(packet_size);
-		if (packet_size > channel_buffer_size) {
-			char *r = realloc(channel_buffer, packet_size);
-			if (!r) { program_state = 2; break; }
-			channel_buffer = r;
-			channel_buffer_size = packet_size;
+		if (channel_state == 1) { // read packet content
+			FD_ZERO(&rfds);
+			FD_SET(STDIN_FILENO,&rfds);
+			tv.tv_sec = 0; tv.tv_usec = 1000;
+			rc = select((STDIN_FILENO + 1), &rfds, NULL, NULL, &tv);
+			if ( -1 == rc ) return;
+			if (rc && FD_ISSET(STDIN_FILENO, &rfds)) {
+				n = read(STDIN_FILENO, channel_buffer + channel_state_pos,
+					channel_packet_size - channel_state_pos);
+				if (n <= 0) {
+					return;
+				}
+				channel_state_pos += n;
+				if (channel_state_pos == channel_packet_size) {
+					channel_state = 3; // write packet to tun
+					channel_state_pos = 0;
+				}
+			} // if can read
 		}
 
-		pos = 0;
-		do {
-			if (program_state != 1) break;
-			n = libssh2_channel_read(sshconn.channel,
-				channel_buffer + pos, packet_size - pos);
-			if (n == LIBSSH2_ERROR_EAGAIN) {
-				if (-1 == ssh_waitsocket(sshconn.sock, sshconn.session)) break;
-				continue;
-			} else if (n < 0) break;
-			pos += n;
-		} while (packet_size - pos > 0);
-		if (n < 0) { program_state = 2; break; }
-		if (program_state != 1) break;
-
-		do {
-			if (program_state != 1) break;
-			n = write(tc.tun_fd, channel_buffer, packet_size);
+		if (channel_state == 3) { // write packet to tun
+			n = write(conn->tun_fd, channel_buffer + channel_state_pos,
+				channel_packet_size - channel_state_pos);
 			if (n < 0) {
 				if ( errno == EINTR || errno == EAGAIN ) continue;
-				break;
-			} else break;
-		} while(1);
-		if (n < 0) { program_state = 2; break; }
+				return;
+			};
+			channel_state_pos += n;
+
+			if (channel_packet_size - channel_state_pos == 0) {
+				channel_state = 0; // read packet size mode
+				channel_state_pos = 0;
+				channel_packet_size = 0;
+			}
+		}
+
+		if (program_state != 1) break;
 	} // while
 
-	pthread_exit(NULL);
-} // thread_server_read_ssh()
+	return;
+} // client_work()
+
+void server_work(struct tun_connection *conn, struct ssh_session *sess) {
+	int rc;
+	ssize_t n;
+
+	size_t packet_size;
+	size_t pos;
+
+	int channel_state = 0; // 0 - read packet size, 1 - read packet
+	size_t channel_packet_size = 0;
+	size_t channel_state_pos = 0;
+
+	// we need send info about packet length in ssh stream (reserve at buffer start size_t space)
+	char *adj_buffer = tun_buffer + sizeof(packet_size);
+	size_t adj_buffer_size = tun_buffer_size - sizeof(packet_size);
+
+	fd_set rfds;
+	struct timeval tv;
+
+	while (1) {
+		// READ FROM TUN
+		FD_ZERO(&rfds);
+		FD_SET(conn->tun_fd,&rfds);
+		tv.tv_sec = 0; tv.tv_usec = 1000;
+		rc = select((conn->tun_fd + 1), &rfds, NULL, NULL, &tv);
+		if ( -1 == rc ) return;
+		if (rc && FD_ISSET(conn->tun_fd, &rfds)) {
+			n = read(conn->tun_fd, adj_buffer, adj_buffer_size);
+			if (n <= 0) {
+				return;
+			}
+
+			// save info about packet size
+			pos = htonl(n);
+			memcpy(tun_buffer, &pos, sizeof(size_t));
+
+			pos = 0;
+			packet_size = n + sizeof(pos); // packet size for write to ssh channel
+			do {
+				n = libssh2_channel_write(sess->channel,
+					tun_buffer + pos, packet_size - pos);
+				if (n < 0) return;
+				pos += n;
+			} while (packet_size - pos > 0);
+		} // if tun can read
+
+		// READ FROM SSH CHANNEL
+		if (channel_state == 0) { // read packet size from ssh channel
+			n = libssh2_channel_read(sess->channel,
+				(char *)(&channel_packet_size) + channel_state_pos,
+				sizeof(channel_packet_size) - channel_state_pos);
+			if (n == LIBSSH2_ERROR_EAGAIN) continue;
+			else if (n < 0) return;
+			channel_state_pos += n;
+			if (sizeof(channel_packet_size) - channel_state_pos == 0) {
+				// after read packet size prepare to read whole packet
+				channel_state = 1;
+				channel_state_pos = 0;
+				channel_packet_size = ntohl(channel_packet_size);
+
+				// adjust buffer size
+				if (channel_packet_size > channel_buffer_size) {
+					char *r = realloc(channel_buffer, channel_packet_size);
+					if (!r) {
+						// TODO no memory log
+						return;
+					}
+					channel_buffer = r;
+					channel_buffer_size = channel_packet_size;
+				}
+			} // if readed
+		} // if state == 0
+
+		if (channel_state == 1) { // read packet from ssh channel
+			n = libssh2_channel_read(sess->channel,
+				channel_buffer + channel_state_pos,
+				channel_packet_size - channel_state_pos);
+			if (n == LIBSSH2_ERROR_EAGAIN) continue;
+			else if (n < 0) return;
+			channel_state_pos += n;
+			if (channel_packet_size - channel_state_pos == 0) {
+				channel_state = 3; // wire packet to tun mode
+				channel_state_pos = 0;
+			}
+		}
+
+		if (channel_state == 3) { // write packet to tun
+			n = write(conn->tun_fd, channel_buffer + channel_state_pos,
+				channel_packet_size - channel_state_pos);
+			if (n < 0) {
+				if ( errno == EINTR || errno == EAGAIN ) continue;
+				return;
+			};
+			channel_state_pos += n;
+
+			if (channel_packet_size - channel_state_pos == 0) {
+				channel_state = 0; // read packet size mode
+				channel_state_pos = 0;
+				channel_packet_size = 0;
+			}
+		}
+
+		if (libssh2_channel_eof(sess->channel)) return;
+
+		if (program_state != 1) break; // program not in work mode
+	} // while
+
+	return;
+} // server_work()
+
+///////////////////////////////////////////////////////
+// MAIN
+///////////////////////////////////////////////////////
 
 void print_help(const char *prog) {
 	printf("%s tun based VPN via SSH connection\n", prog);
 	printf("Usage: %s [options]\n", prog);
+	printf("\t-f - foreground mode (daemonize by default)\n");
 	printf("\t-s - work as server (connect to remote ssh)\n");
 	printf("\t-c - work as client\n");
 	printf("\t-n <subnet> - tun p-t-p /30 subnet (example: 10.254.254.0)\n");
@@ -561,7 +626,7 @@ void print_help(const char *prog) {
 	printf("\t-a <id_rsa.pub> - public key file\n");
 	printf("\t-b <id_rsa> - private key file\n");
 	printf("\t-x <password> - private key password\n");
-//	printf("\t-r - permanent connection\n");
+	printf("\t-r - permanent connection (retry after error, pause 15 sec)\n");
 	exit(0);
 } // print_help()
 
@@ -570,9 +635,10 @@ int main(int argc, char **argv) {
 
 	// Parse program options
 	int opt = 0;
-	while ( (opt = getopt(argc, argv, "hscn:H:P:u:o:a:b:x:r")) != -1)
+	while ( (opt = getopt(argc, argv, "hfscn:H:P:u:o:a:b:x:r")) != -1)
 	switch (opt) {
 		case 'h': print_help(argv[0]); break;
+		case 'f': opt_foreground = 1; break;
 
 		case 's': case 'c':
 			if (work_mode != WORK_MODE_UNKNOWN) {
@@ -641,7 +707,7 @@ int main(int argc, char **argv) {
 		return 1;
 	};
 
-//main_retry:
+main_retry:
 	// Init libssh2 library
 	rc = libssh2_init(0);
 	if (rc) {
@@ -751,93 +817,67 @@ int main(int argc, char **argv) {
 	ssize_t nread;
 	int find_client_sign = 0;
 	const char *sign_pos = session_start_sign;
-	while(1) {
-		do {
-			nread = libssh2_channel_read(sshconn.channel,
-				channel_buffer, channel_buffer_size);
 
-			if (nread > 0) { // try find start signature in buffer
-				ssize_t n = 0;
-				while (!find_client_sign && n < nread) {
-					if (*sign_pos == (unsigned char)channel_buffer[n]) {
-						sign_pos++;
-					} else {
-						sign_pos = session_start_sign;
-					}
-					n++;
-					if (*sign_pos == '\0') {
-						find_client_sign = 1;
-						break;
-					}
+	do {
+		nread = libssh2_channel_read(sshconn.channel,
+			channel_buffer, channel_buffer_size);
+
+		if (nread > 0) { // try find start signature in buffer
+			ssize_t n = 0;
+			while (!find_client_sign && n < nread) {
+				if (*sign_pos == (unsigned char)channel_buffer[n]) {
+					sign_pos++;
+				} else {
+					sign_pos = session_start_sign;
+				}
+				n++;
+				if (*sign_pos == '\0') {
+					find_client_sign = 1;
+					break;
 				}
 			}
-			if (find_client_sign) break;
-		} while (nread > 0);
-		if (nread == LIBSSH2_ERROR_EAGAIN) {
-			ssh_waitsocket(sshconn.sock, sshconn.session);
-			continue;
-		} else break;
-	};
+		} else {
+			if (nread == LIBSSH2_ERROR_EAGAIN) {
+				if (-1 == ssh_waitsocket(sshconn.sock, sshconn.session)) break;
+				continue;
+			} else if (nread < 0) break;
+		}
+		if (find_client_sign) break;
+
+		if (libssh2_channel_eof(sshconn.channel)) goto exit_channel;
+	} while (!find_client_sign);
 
 	if (!find_client_sign) {
 		fprintf(stderr,"Can't find start channel signature\n");
 		goto exit_channel;
 	}
 
+	// Prepare firewall for forwarding traffic
 	if (0 != run_command("/usr/sbin/iptables -I FORWARD -i %s ! -o %s -j ACCEPT",tc.tun_name,tc.tun_name)) goto exit_iptables;
 	if (0 != run_command("/usr/sbin/iptables -I FORWARD -o %s ! -i %s -j ACCEPT",tc.tun_name,tc.tun_name)) goto exit_iptables;
 	if (0 != run_command("/usr/sbin/iptables -t nat -I POSTROUTING -s %s -j MASQUERADE",inet_ntoa(remote_ptp_ip))) goto exit_iptables;
 	if (0 != run_command("echo 1 > /proc/sys/net/ipv4/ip_forward")) goto exit_iptables;
 
-#ifdef PRODUCTION
-	if (daemon(0, 0) != 0) {
-		fprintf(stderr,"Can't daemonize process!\n");
-		goto exit_iptables;
-	};
-#endif
-
-	rc = pthread_create(&pth[0], NULL, thread_server_read_ssh, NULL);
-	if (rc != 0) {
-		fprintf(stderr,"Can't start ssh thread\n");
-		goto exit_threads;
-	};
-
-	rc = pthread_create(&pth[1], NULL, thread_server_read_tun, NULL);
-	if (rc != 0) {
-		fprintf(stderr,"Can't start tun thread\n");
-		program_state = 2;
-		goto exit_threads;
-	};
-
-	goto skip_client_ssh;
+	if (!opt_foreground) {
+		if (daemon(0, 0) != 0) {
+			fprintf(stderr,"Can't daemonize process!\n");
+			goto exit_iptables;
+		};
+	}
 
 skip_server_ssh:
-	rc = pthread_create(&pth[0], NULL, thread_client_read_ssh, NULL);
-	if (rc != 0) {
-		fprintf(stderr,"Can't start ssh thread\n");
-		goto exit_threads;
-	};
-	rc = pthread_create(&pth[1], NULL, thread_client_read_tun, NULL);
-	if (rc != 0) {
-		fprintf(stderr,"Can't start tun thread\n");
-		program_state = 2;
-		goto exit_threads;
-	};
-
-skip_client_ssh:
-	program_state = 1; // start pthreads work
-
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
 
+	program_state = 1; // start
+
 	// Main work cycle
-	while (program_state == 1) sleep(1);
-
-exit_threads:
-	if (pth[0] != 0) pthread_join(pth[0], NULL);
-	if (pth[1] != 0) pthread_join(pth[1], NULL);
-
-	if (work_mode == WORK_MODE_CLIENT) goto exit_tun_ip;
+	if (work_mode == WORK_MODE_CLIENT) {
+		client_work(&tc);
+		goto exit_tun_ip;
+	} else {
+		server_work(&tc, &sshconn);
+	}
 
 exit_iptables:
 	run_command("/usr/sbin/iptables -D FORWARD -i %s ! -o %s -j ACCEPT",tc.tun_name,tc.tun_name);
@@ -862,6 +902,16 @@ exit_tun:
 
 	libssh2_exit();
 
-//	if (opt_server_permanent && program_state == 2) goto main_retry;
+	if (
+		work_mode == WORK_MODE_SERVER
+		&& opt_server_permanent
+		&& program_state != 3
+	) {
+		// TODO refactor permanent mode, restart only SSH session
+		// and don't touch tun and ip/route/iptables
+		sleep(15);
+		goto main_retry;
+	}
+
 	return 0;
 } // main()
