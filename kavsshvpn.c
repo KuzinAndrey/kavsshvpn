@@ -1,30 +1,36 @@
-//
-// kavsshvpn - SSH based tun reverse VPN
-//
-// Author: kuzinandrey@yandex.ru
-//
-// URL: https://www.github.com/KuzinAndrey/kavsshvpn
-//
-// Dependency:
-//    libssh2 - library for SSH communication
-//
-// Build:
-//    LIBSSH2=$(pkg-config libssh2 --cflags --libs)
-//    gcc -Wall -s -DPRODUCTION=1 -pedantic kavsshvpn.c $LIBSSH2 -o kavsshvpn
-//
-// Run:
-//    sudo ./kavsshvpn -r -s -n 10.254.254.0 -H 111.110.11.22 \
-//        -a /home/user/.ssh/id_rsa.pub \
-//        -b /home/user/.ssh/id_rsa \
-//        -x "secretprikeypass"
-//
-// History:
-//   2024-04-21 - Initial version
-//   2024-04-24 - Refactor code from multithreaded style,
-//      because at high traffic buffer overflow occured
-//      in SSH library and rise assert with SIGABRT.
-//      Who use assert() in library code?! You are crazy?
-//
+/*
+///////////////////////////////////////////////////////
+
+kavsshvpn - SSH based tun reverse VPN
+
+Author: kuzinandrey@yandex.ru
+
+URL: https://www.github.com/KuzinAndrey/kavsshvpn
+
+///////////////////////////////////////////////////////
+
+Dependency:
+    libssh2 - library for SSH communication
+
+Build:
+    LIBSSH2=$(pkg-config libssh2 --cflags --libs)
+    gcc -Wall -s -DPRODUCTION=1 -pedantic kavsshvpn.c $LIBSSH2 -o kavsshvpn
+
+Run:
+    sudo ./kavsshvpn -r -s -n 10.254.254.0 -H 111.110.11.22 \
+      -a /home/user/.ssh/id_rsa.pub \
+      -b /home/user/.ssh/id_rsa \
+      -x "secretprikeypass"
+
+History:
+   2024-04-21 - Initial version
+   2024-04-24 - Refactor code from multithreaded style,
+       because at high traffic buffer overflow occured
+       in SSH library and rise assert with SIGABRT.
+       Who use assert() in library code?! You are crazy?
+
+///////////////////////////////////////////////////////
+*/
 
 #define _GNU_SOURCE
 #include <stdio.h>

@@ -18,6 +18,7 @@ with this internet server and use it as your own proxy-router into LAN.
 $ ./kavcachefs -h
 ./kavsshvpn tun based VPN via SSH connection
 Usage: ./kavsshvpn [options]
+	-f - foreground mode (daemonize by default)
 	-s - work as server (connect to remote ssh)
 	-c - work as client
 	-n <subnet> - tun p-t-p /30 subnet (example: 10.254.254.0)
@@ -28,6 +29,7 @@ Usage: ./kavsshvpn [options]
 	-a <id_rsa.pub> - public key file
 	-b <id_rsa> - private key file
 	-x <password> - private key password
+	-r - permanent connection (retry after error, pause 15 sec)
 ```
 
 ## Usage
@@ -71,7 +73,7 @@ $ cp ./kavsshvpn /bin/kavsshvpn
 
 ## TODO
 
-- [ ] - option for retry reconnect after any fail
+- [x] - option for retry reconnect after any fail
 - [ ] - option for additional subnets routes in lAN
 - [ ] - make connection as default route all traffic into LAN
 - [ ] - hide private key password in 'ps aux'

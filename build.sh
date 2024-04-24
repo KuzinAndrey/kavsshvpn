@@ -11,4 +11,4 @@ LIBSSH2=$(pkg-config libssh2 --cflags --libs)
 
 LIBS="$LIBSSH2"
 
-gcc -Wall -pthread $MODE -pedantic kavsshvpn.c $LIBS -o kavsshvpn
+gcc -Wall $MODE -pedantic kavsshvpn.c $LIBS -o kavsshvpn
