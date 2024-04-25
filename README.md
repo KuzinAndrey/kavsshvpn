@@ -29,7 +29,8 @@ Usage: ./kavsshvpn [options]
 	-a <id_rsa.pub> - public key file
 	-b <id_rsa> - private key file
 	-x <password> - private key password
-	-r - permanent connection (retry after error, pause 15 sec)
+	-r - permanent connection (retry after error)
+	-w <sec> - wait between retry (default 15 sec)
 ```
 
 ## Usage

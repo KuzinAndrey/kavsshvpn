@@ -26,7 +26,8 @@ History:
    2024-04-21 - Initial version
    2024-04-24 - Refactor code from multithreaded style, because at high traffic
        buffer overflow occured in SSH library and rise assert with SIGABRT.
-   2024-04-25 - Add more read/write return checks for stable work
+   2024-04-25 - Add more read/write return checks for stable work.
+       Add -w parameter to set retry delay between reconnections to SSH server.
 ///////////////////////////////////////////////////////
 */
 
@@ -368,6 +369,7 @@ char *opt_ssh_keypass = NULL;
 
 int opt_foreground = 0;
 int opt_server_permanent = 0;
+int opt_server_retry_wait = 15;
 
 const char *session_start_sign = "ReAdy-SeT-Go!\n";
 struct tun_connection tc = {0};
@@ -649,7 +651,8 @@ void print_help(const char *prog) {
 	printf("\t-a <id_rsa.pub> - public key file\n");
 	printf("\t-b <id_rsa> - private key file\n");
 	printf("\t-x <password> - private key password\n");
-	printf("\t-r - permanent connection (retry after error, pause 15 sec)\n");
+	printf("\t-r - permanent connection (retry after error)\n");
+	printf("\t-w <sec> - wait between retry (default 15 sec)\n");
 	exit(0);
 } // print_help()
 
@@ -658,7 +661,7 @@ int main(int argc, char **argv) {
 
 	// Parse program options
 	int opt = 0;
-	while ( (opt = getopt(argc, argv, "hfscn:H:P:u:o:a:b:x:r")) != -1)
+	while ( (opt = getopt(argc, argv, "hfscn:H:P:u:o:a:b:x:rw:")) != -1)
 	switch (opt) {
 		case 'h': print_help(argv[0]); break;
 		case 'f': opt_foreground = 1; break;
@@ -691,6 +694,14 @@ int main(int argc, char **argv) {
 		case 'b': opt_ssh_privkey = optarg; break;
 		case 'x': opt_ssh_keypass = optarg; break;
 		case 'r': opt_server_permanent = 1; break;
+
+		case 'w':
+			opt_server_retry_wait = atoi(optarg);
+			if (opt_server_retry_wait < 0) {
+				fprintf(stderr,"Value of -w parameter can't be negative\n");
+				return 1;
+			}
+			break;
 
 		case '?':
 			fprintf(stderr,"Unknown option: %c\n", optopt);
@@ -938,7 +949,7 @@ exit_tun:
 	) {
 		// TODO refactor permanent mode, restart only SSH session
 		// and don't touch tun and ip/route/iptables
-		sleep(15);
+		if (opt_server_retry_wait > 0) sleep(opt_server_retry_wait);
 		goto main_retry;
 	}
 
