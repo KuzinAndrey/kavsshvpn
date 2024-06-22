@@ -6,14 +6,14 @@ Local SNAT-ed server in private network with RFC1918 IP address can be
 your VPN into LAN as "trojan horse". Program help make connection from
 this server to Real-IP server in internet via SSH protocol and tune
 routing table for all private subnets and work as MASQUERADE router
-into LAN (with option "-t rfc1918").
+into LAN (with option `-t rfc1918`).
 
 After that you can make OpenVPN, WireGuard or other classic VPN connection
 with this internet server and use it as your own proxy-router into LAN.
 
 Another case of usage is a share your connection via SSH for host
-to access full internet (with "-t default"), or only with special subnets
-or IP addresses (with "-t <subnet>"). This can help to manage servers
+to access full internet (with `-t default`), or only with special subnets
+or IP addresses (with `-t <subnet>`). This can help to manage servers
 in protected areas without access to internet.
 
 ## Help
@@ -50,7 +50,7 @@ $ sudo ./kavsshvpn -s \
 	-n 10.254.254.0 \
 	-a /home/user/.ssh/id_rsa.pub \
 	-b /home/user/.ssh/id_rsa \
-	-x "secretkeypass"
+	-x "secretkeypass" \
 	-t rfc1918
 ```
 
