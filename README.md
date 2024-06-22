@@ -103,8 +103,8 @@ $ cp ./kavsshvpn /bin/kavsshvpn
 ## TODO
 
 - [x] - option for retry reconnect after any fail
-- [ ] - option for additional subnets routes in lAN
-- [ ] - make connection as default route all traffic into LAN
+- [x] - option for additional subnets routes in LAN
+- [x] - make connection as default route all traffic into LAN
 - [ ] - hide private key password in 'ps aux'
 
 ## Useful links
