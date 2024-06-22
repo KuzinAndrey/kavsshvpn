@@ -6,11 +6,15 @@ Local SNAT-ed server in private network with RFC1918 IP address can be
 your VPN into LAN as "trojan horse". Program help make connection from
 this server to Real-IP server in internet via SSH protocol and tune
 routing table for all private subnets and work as MASQUERADE router
-into LAN.
+into LAN (with option "-t rfc1918").
 
 After that you can make OpenVPN, WireGuard or other classic VPN connection
 with this internet server and use it as your own proxy-router into LAN.
 
+Another case of usage is a share your connection via SSH for host
+to access full internet (with "-t default"), or only with special subnets
+or IP addresses (with "-t <subnet>"). This can help to manage servers
+in protected areas without access to internet.
 
 ## Help
 
@@ -31,6 +35,7 @@ Usage: ./kavsshvpn [options]
 	-x <password> - private key password
 	-r - permanent connection (retry after error)
 	-w <sec> - wait between retry (default 15 sec)
+	-t <subnet>|default|rfc1918 - add route on client
 ```
 
 ## Usage
@@ -46,6 +51,29 @@ $ sudo ./kavsshvpn -s \
 	-a /home/user/.ssh/id_rsa.pub \
 	-b /home/user/.ssh/id_rsa \
 	-x "secretkeypass"
+	-t rfc1918
+```
+
+Share all routes for server 192.168.2.23:
+```bash
+$ sudo ./kavsshvpn -s \
+	-H 192.168.2.23 \
+	-P 22 \
+	-n 10.254.253.0 \
+	-a /home/admin/.ssh/id_rsa.pub \
+	-b /home/admin/.ssh/id_rsa \
+	-t default
+```
+
+Share only specified subnet 10.168.1.0/24 for server:
+```bash
+$ sudo ./kavsshvpn -s \
+	-H 111.222.33.44 \
+	-P 22 \
+	-n 10.254.252.0 \
+	-a /home/admin/.ssh/id_rsa.pub \
+	-b /home/admin/.ssh/id_rsa \
+	-t 10.168.1.0/24
 ```
 
 ## Build

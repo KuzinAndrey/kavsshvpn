@@ -20,7 +20,8 @@ Run:
     sudo ./kavsshvpn -r -s -n 10.254.254.0 -H 111.110.11.22 \
       -a /home/user/.ssh/id_rsa.pub \
       -b /home/user/.ssh/id_rsa \
-      -x "secretprikeypass"
+      -x "secretprikeypass" \
+      -t rfc1918
 
 History:
    2024-04-21 - Initial version
@@ -28,6 +29,8 @@ History:
        buffer overflow occured in SSH library and rise assert with SIGABRT.
    2024-04-25 - Add more read/write return checks for stable work.
        Add -w parameter to set retry delay between reconnections to SSH server.
+   2024-06-22 - Add parameter -t to manage client routing table (now by default
+       don't change any routes on target host)
 ///////////////////////////////////////////////////////
 */
 
@@ -371,6 +374,12 @@ int opt_foreground = 0;
 int opt_server_permanent = 0;
 int opt_server_retry_wait = 15;
 
+int opt_client_route_default = 0;
+int opt_client_route_rfc1918 = 0;
+char *opt_client_routes = NULL;
+size_t opt_client_routes_count = 0;
+char *client_default_route_delete_command = NULL;
+
 const char *session_start_sign = "ReAdy-SeT-Go!\n";
 struct tun_connection tc = {0};
 struct ssh_session sshconn = {0};
@@ -379,6 +388,10 @@ char *tun_buffer = NULL;
 size_t tun_buffer_size = 32 << 10;
 char *channel_buffer = NULL;
 size_t channel_buffer_size = 32 << 10;
+
+char *vpncmd = NULL;
+
+#define PROC_NET_ROUTE_PATH "/proc/net/route"
 
 ///////////////////////////////////////////////////////
 // CLIENT/SERVER WORK
@@ -653,15 +666,62 @@ void print_help(const char *prog) {
 	printf("\t-x <password> - private key password\n");
 	printf("\t-r - permanent connection (retry after error)\n");
 	printf("\t-w <sec> - wait between retry (default 15 sec)\n");
+	printf("\t-t <subnet>|default|rfc1918 - add route on client\n");
 	exit(0);
 } // print_help()
+
+
+char *get_default_gateway(char *buffer) {
+	FILE *net_route = fopen(PROC_NET_ROUTE_PATH,"r");
+	if (!net_route) {
+		fprintf(stderr,"can't open file %s\n",PROC_NET_ROUTE_PATH);
+		return NULL;
+	}
+
+	char skip_header[128];
+	if (!fgets(skip_header, sizeof(skip_header), net_route)) {
+		fprintf(stderr,"can't skip header of %s\n",PROC_NET_ROUTE_PATH);
+		fclose(net_route);
+		return NULL;
+	}
+
+	char routeif_name[IFNAMSIZ];
+	struct in_addr route_net;
+	struct in_addr route_mask;
+	struct in_addr route_gw;
+	unsigned int no;
+	int s;
+
+	sprintf(buffer, "%s", ""); // default empty
+
+	while (1) {
+		s = fscanf(net_route, "%s\t%X\t%X\t%X\t%u\t%u\t%u\t%X\t%u\t%u\t%u",
+		routeif_name, &route_net.s_addr, &route_gw.s_addr, &no, &no, &no, &no,
+		&route_mask.s_addr, &no, &no, &no);
+
+		if (s != 11) break;
+		//printf("read %d %s %d\n", s, routeif_name, IFNAMSIZ);
+
+		if (route_net.s_addr == 0 && route_mask.s_addr == 0) {
+			sprintf(buffer,"%s", inet_ntoa(route_gw));
+		}
+		//printf("iface: %s,", routeif_name);
+		//printf(" dst %s,", inet_ntoa(route_net));
+		//printf(" mask %s,", inet_ntoa(route_mask));
+		//printf(" gw %s\n", inet_ntoa(route_gw));
+	}
+
+	fclose(net_route);
+	return buffer;
+} // get_default_gateway(
+
 
 int main(int argc, char **argv) {
 	int rc = 0;
 
 	// Parse program options
 	int opt = 0;
-	while ( (opt = getopt(argc, argv, "hfscn:H:P:u:o:a:b:x:rw:")) != -1)
+	while ( (opt = getopt(argc, argv, "hfscn:H:P:u:o:a:b:x:rw:t:")) != -1)
 	switch (opt) {
 		case 'h': print_help(argv[0]); break;
 		case 'f': opt_foreground = 1; break;
@@ -700,6 +760,33 @@ int main(int argc, char **argv) {
 			if (opt_server_retry_wait < 0) {
 				fprintf(stderr,"Value of -w parameter can't be negative\n");
 				return 1;
+			}
+			break;
+
+		case 't':
+			if (!strcmp(optarg, "rfc1918")) {
+				opt_client_route_rfc1918 = 1;
+			} else if (!strcmp(optarg, "default")) {
+				opt_client_route_default = 1;
+			} else {
+				if (!opt_client_routes) {
+					opt_client_routes = strdup(optarg);
+					if (opt_client_routes) opt_client_routes_count = 1;
+				} else {
+					size_t routes_len = strlen(opt_client_routes);
+					size_t optarg_len = strlen(optarg);
+					if (strchr(optarg,' ')) {
+						fprintf(stderr, "Client route subnet \"%s\" can't contain space chars\n", optarg);
+						return 1;
+					}
+					char *add_route = realloc(opt_client_routes, routes_len + optarg_len + 2);
+					if (add_route) {
+						*(add_route + routes_len) = ' ';
+						memcpy(add_route + routes_len + 1, optarg, optarg_len + 1);
+						opt_client_routes_count++;
+						opt_client_routes = add_route;
+					}
+				}
 			}
 			break;
 
@@ -799,27 +886,114 @@ main_retry:
 	};
 
 	if (work_mode == WORK_MODE_CLIENT) {
-		const char *rfc1918[] = {"10.0.0.0/8","172.16.0.0/12","192.168.0.0/16",NULL};
-		const char **net = rfc1918;
-		while (*net) {
-			if (0 != run_command("/sbin/ip route add %s via %s",
-				*net, inet_ntoa(remote_ptp_ip))
+		// If we want change default gw, we must save current route to SSH connected client
+		if (opt_client_route_default == 1) {
+			const char *ssh_remote_addr = getenv("SSH_CLIENT");
+			if (!ssh_remote_addr) {
+				fprintf(stderr, "can't found %s in environment\n","SSH_CLIENT");
+				goto exit_tun_ip;
+			}
+
+			char gw_ip[128];
+			char remote_ssh_ip[128];
+			if (
+				1 == sscanf(ssh_remote_addr, "%s", remote_ssh_ip)
+				&& get_default_gateway(gw_ip)
+				&& strlen(gw_ip) > 0
+				&& -1 != asprintf(&client_default_route_delete_command,"/sbin/ip route del %s via %s", remote_ssh_ip, gw_ip)
 			) {
-				fprintf(stderr, "error set route for %s tun iface\n", *net);
-				goto exit_tun_link;
-			};
-			net++;
+				if (
+					0 != run_command("/sbin/ip route add %s via %s",remote_ssh_ip, gw_ip)
+				) {
+					fprintf(stderr, "error set route to %s via %s gateway\n", remote_ssh_ip, gw_ip);
+					goto exit_tun_ip;
+				}
+
+				if (0 != run_command("/sbin/ip route add %s via %s",
+					"0/0", inet_ntoa(remote_ptp_ip))
+				) {
+					fprintf(stderr, "error set default route via tun iface\n");
+					goto exit_client_default_gw;
+				}
+			} else {
+				fprintf(stderr, "error get info about default route\n");
+				goto exit_tun_ip;
+			}
 		}
+
+		// Add RFC1918 private subnets via tun connection
+		if (opt_client_route_rfc1918 == 1) {
+			const char *rfc1918[] = {"10.0.0.0/8","172.16.0.0/12","192.168.0.0/16",NULL};
+			const char **net = rfc1918;
+			while (*net) {
+				if (0 != run_command("/sbin/ip route add %s via %s",
+					*net, inet_ntoa(remote_ptp_ip))
+				) {
+					fprintf(stderr, "error set route for %s via tun iface\n", *net);
+					if (client_default_route_delete_command) goto exit_client_default_gw;
+					goto exit_tun_ip;
+				};
+				net++;
+			}
+		}
+
+		// Add additional subnets routes via tun connection
+		if (opt_client_routes_count > 0) {
+			char subnet[128];
+			char *scp = opt_client_routes;
+			while (1 == sscanf(scp, "%s", subnet)) {
+				if (0 != run_command("/sbin/ip route add %s via %s",
+					subnet, inet_ntoa(remote_ptp_ip))
+				) {
+					fprintf(stderr, "error set route for %s via tun iface\n", subnet);
+					if (client_default_route_delete_command) goto exit_client_default_gw;
+					goto exit_tun_ip;
+				}
+				scp += strlen(subnet);
+				if (*scp == ' ') scp++; else break;
+			}
+		}
+
 		goto skip_server_ssh;
 	}
 
 	fprintf(stderr,"Work in server mode\n");
 
-	char *vpncmd = NULL;
 	char *progname = strrchr(argv[0], '/');
-	if (-1 == asprintf(&vpncmd,"sudo %s -c -n %s", progname ? progname+1 : argv[0], opt_ptp_subnet)) {
+	if (-1 == asprintf(&vpncmd,"sudo -E %s -c -n %s", progname ? progname+1 : argv[0], opt_ptp_subnet)) {
 		fprintf(stderr, "Can't create ssh run command\n");
 		goto exit_tun_ip;
+	}
+
+	// Add routes options in client command line
+	char *vpncmdadd = NULL;
+	size_t vpncmdlen = strlen(vpncmd);
+	if (opt_client_route_default == 1) {
+		vpncmdadd = realloc(vpncmd, vpncmdlen + strlen(" -t ") + strlen("default") + 1);
+		if (vpncmdadd) {
+			vpncmdlen += sprintf(vpncmdadd + vpncmdlen, " -t %s", "default");
+			vpncmd = vpncmdadd;
+		}
+	}
+	if (opt_client_route_rfc1918 == 1) {
+		vpncmdadd = realloc(vpncmd, vpncmdlen + strlen(" -t ") + strlen("rfc1918") + 1);
+		if (vpncmdadd) {
+			vpncmdlen += sprintf(vpncmdadd + vpncmdlen, " -t %s", "rfc1918");
+			vpncmd = vpncmdadd;
+		}
+	}
+	if (opt_client_routes_count > 0) {
+		char subnet[128];
+		char *scp = opt_client_routes;
+		while (1 == sscanf(scp, "%s", subnet)) {
+			vpncmdadd = realloc(vpncmd, vpncmdlen + strlen(" -t ") + strlen(subnet) + 1);
+			if (vpncmdadd) {
+				vpncmdlen += sprintf(vpncmdadd + vpncmdlen, " -t %s", subnet);
+				vpncmd = vpncmdadd;
+			}
+			scp += strlen(subnet);
+			if (*scp == ' ') scp++; else break;
+		}
 	}
 
 	if (opt_ssh_user) sshconn.user = strdup(opt_ssh_user);
@@ -897,6 +1071,8 @@ main_retry:
 			fprintf(stderr,"Can't daemonize process!\n");
 			goto exit_iptables;
 		};
+	} else {
+		fprintf(stderr,"Work in foreground mode (press Ctrl+C for break)\n");
 	}
 
 skip_server_ssh:
@@ -911,7 +1087,7 @@ skip_server_ssh:
 		if (rc < 0) {
 			syslog(LOG_ERR,"%s() end work with code %d", "client_work", rc);
 		}
-		goto exit_tun_ip;
+		goto exit_client_default_gw;
 	} else {
 		rc = server_work(&tc, &sshconn);
 		if (rc < 0) {
@@ -930,6 +1106,11 @@ exit_channel:
 	clean_ssh_channel(&sshconn);
 exit_ssh:
 	clean_ssh_session(&sshconn);
+exit_client_default_gw:
+	if (work_mode == WORK_MODE_CLIENT && client_default_route_delete_command) {
+		run_command("%s", client_default_route_delete_command);
+		free(client_default_route_delete_command);
+	}
 exit_tun_ip:
 	run_command("/sbin/ip address del %s/30 dev %s",
 		inet_ntoa(local_ptp_ip), tc.tun_name);
@@ -938,6 +1119,7 @@ exit_tun_link:
 exit_tun:
 	if (tun_buffer) { free(tun_buffer); tun_buffer = NULL; }
 	if (channel_buffer) { free(channel_buffer); channel_buffer = NULL; }
+	if (vpncmd) { free(vpncmd); vpncmd = NULL; }
 	down_tun_iface(&tc);
 
 	libssh2_exit();
@@ -953,5 +1135,6 @@ exit_tun:
 		goto main_retry;
 	}
 
+	if (opt_client_routes) { free(opt_client_routes); opt_client_routes = NULL; }
 	return 0;
 } // main()
