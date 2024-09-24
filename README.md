@@ -18,7 +18,7 @@ in protected areas without access to internet.
 
 ## Help
 
-```bash
+```shell
 $ ./kavcachefs -h
 ./kavsshvpn tun based VPN via SSH connection
 Usage: ./kavsshvpn [options]
@@ -43,7 +43,7 @@ Usage: ./kavsshvpn [options]
 Make reverse connection to Real-IP SSH server 111.222.33.44, up point-to-point
 subnet [lan 10.254.254.1 --- inet 10.254.254.2], use for auth public key file
 and password encrypted primary key.
-```bash
+```shell
 $ sudo ./kavsshvpn -s \
 	-H 111.222.33.44 \
 	-P 22 \
@@ -55,7 +55,7 @@ $ sudo ./kavsshvpn -s \
 ```
 
 Share all routes for server 192.168.2.23:
-```bash
+```shell
 $ sudo ./kavsshvpn -s \
 	-H 192.168.2.23 \
 	-P 22 \
@@ -66,7 +66,7 @@ $ sudo ./kavsshvpn -s \
 ```
 
 Share only specified subnet 10.168.1.0/24 for server:
-```bash
+```shell
 $ sudo ./kavsshvpn -s \
 	-H 111.222.33.44 \
 	-P 22 \
@@ -81,7 +81,7 @@ $ sudo ./kavsshvpn -s \
 Prepare new empty cloud server with Ubuntu 22.04 for build and run kavsshvpn
 as Real-IP server.
 
-```bash
+```shell
 
 $ sudo apt update && sudo apt upgrade
 $ reboot
@@ -92,12 +92,26 @@ $ sudo apt install -y git
 $ sudo apt install -y pkg-config libssh2-1-dev
 ```
 
+For Alpine Linux distribution:
+```shell
+$ apk add build-base git linux-headers libssh2-dev
+```
+
 Clone and build:
-```bash
+```shell
 $ git clone https://github.com/KuzinAndrey/kavsshvpn.git
 $ cd kavsshvpn
-$ ./build prod
+$ ./build.sh prod
 $ cp ./kavsshvpn /bin/kavsshvpn
+```
+
+## sudo configuration
+
+For limit access to SSH server user `tunuser` only to run `kavsshvpn` you need create sudoers rules file:
+```shell
+(cat > /etc/sudoers.d/tunuser) << EOF
+tunuser ALL=(ALL:ALL) NOPASSWD:SETENV: /bin/kavsshvpn
+EOF
 ```
 
 ## TODO
