@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 P="./kavsshvpn"
 [ ! -x "$P" ] && echo "Can't found $P" && exit 1
