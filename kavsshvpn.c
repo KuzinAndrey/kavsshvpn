@@ -31,6 +31,13 @@ History:
        Add -w parameter to set retry delay between reconnections to SSH server.
    2024-06-22 - Add parameter -t to manage client routing table (now by default
        don't change any routes on target host)
+   2024-09-24 - Some useful changes:
+        * find path for iptables and ip command
+        * save system ipv4 forward status at start (prevent broke already working linux routers)
+        * add run modprobe for tun driver
+        * option for invert forwarding roles (for work as classic VPN then
+          you connect to server, because in our terms SSH server you connected
+          to is a "client")
 ///////////////////////////////////////////////////////
 */
 
@@ -67,6 +74,7 @@ History:
 #endif
 
 int program_state = 0; // 2 - exit
+int run_command(const char *fmt, ...);
 
 ///////////////////////////////////////////////////////
 //////// TUN
@@ -80,11 +88,19 @@ struct tun_connection {
 // OPEN TUN DEVICE (return -1 if error)
 int up_tun_iface(struct tun_connection *conn, const char *name) {
 	struct ifreq ifr;
+	int retry = 0;
 
 	if (!conn || !name) return -1;
 
+retry:
 	if ((conn->tun_fd = open("/dev/net/tun", O_RDWR)) < 0) {
 		fprintf(stderr,"Can't open /dev/net/tun: %s\n", strerror(errno));
+		if (errno == ENOENT) {
+			if (0 == run_command("modprobe tun") && !retry) {
+				retry++;
+				goto retry;
+			}
+		}
 		return -1;
 	}
 
@@ -389,9 +405,35 @@ size_t tun_buffer_size = 32 << 10;
 char *channel_buffer = NULL;
 size_t channel_buffer_size = 32 << 10;
 
+int ip_forward_state = 0;
+#define PROC_IPV4_IP_FORWARD "/proc/sys/net/ipv4/ip_forward"
+
 char *vpncmd = NULL;
 
 #define PROC_NET_ROUTE_PATH "/proc/net/route"
+
+int opt_invert_roles = 0;
+
+const char *iptables_bin = NULL;
+const char *iptables_search[] = {
+	"/usr/local/sbin/iptables",
+	"/usr/local/bin/iptables",
+	"/usr/sbin/iptables",
+	"/usr/bin/iptables",
+	"/sbin/iptables",
+	"/usr/iptables",
+	NULL };
+
+const char *ip_bin = NULL;
+const char *ip_search[] = {
+	"/usr/local/sbin/ip",
+	"/usr/local/bin/ip",
+	"/usr/sbin/ip",
+	"/usr/bin/ip",
+	"/sbin/ip",
+	"/usr/ip",
+	NULL };
+
 
 ///////////////////////////////////////////////////////
 // CLIENT/SERVER WORK
@@ -656,6 +698,7 @@ void print_help(const char *prog) {
 	printf("\t-f - foreground mode (daemonize by default)\n");
 	printf("\t-s - work as server (connect to remote ssh)\n");
 	printf("\t-c - work as client\n");
+	printf("\t-i - invert roles (client in forwarding mode)\n");
 	printf("\t-n <subnet> - tun p-t-p /30 subnet (example: 10.254.254.0)\n");
 	printf("\t-H <ip> - ssh host (example: 181.67.121.32)\n");
 	printf("\t-P <port> - ssh port (default 22)\n");
@@ -713,17 +756,69 @@ char *get_default_gateway(char *buffer) {
 
 	fclose(net_route);
 	return buffer;
-} // get_default_gateway(
+} // get_default_gateway()
 
+int get_ipv4_forward() {
+	FILE *f = NULL;
+	int mode = -1; // default error
+
+	f = fopen(PROC_IPV4_IP_FORWARD, "r");
+	if (f) {
+		if (1 != fscanf(f, "%d", &mode)) mode = -1;
+		fclose(f);
+		return mode;
+	}
+
+	return mode;
+} // get_ipv4_forward()
+
+int prepare_forwarding(struct in_addr *remote_ptp_ip) {
+	if (0 != run_command("%s -I FORWARD -i %s ! -o %s -j ACCEPT",
+		iptables_bin, tc.tun_name, tc.tun_name)) return 1;
+
+	if (0 != run_command("%s -I FORWARD -o %s ! -i %s -j ACCEPT",
+		iptables_bin, tc.tun_name, tc.tun_name)) return 1;
+
+	if (opt_invert_roles) {
+		// client is router
+		if (0 != run_command("%s -t nat -I POSTROUTING ! -o %s -j MASQUERADE",
+			iptables_bin, tc.tun_name)) return 1;
+	} else {
+		if (0 != run_command("%s -t nat -I POSTROUTING -s %s -j MASQUERADE",
+			iptables_bin, inet_ntoa(*remote_ptp_ip))) return 1;
+	}
+
+	if (ip_forward_state == 0) {
+		if (0 != run_command("echo 1 > %s", PROC_IPV4_IP_FORWARD)) return 1;
+	}
+
+	return 0;
+} // prepare_forwarding()
+
+void clean_forwarding(struct in_addr *remote_ptp_ip) {
+	run_command("%s -D FORWARD -i %s ! -o %s -j ACCEPT", iptables_bin, tc.tun_name, tc.tun_name);
+	run_command("%s -D FORWARD -o %s ! -i %s -j ACCEPT", iptables_bin, tc.tun_name, tc.tun_name);
+
+	if (opt_invert_roles) {
+		run_command("%s -t nat -D POSTROUTING ! -o %s -j MASQUERADE", iptables_bin, tc.tun_name);
+	} else {
+		run_command("%s -t nat -D POSTROUTING -s %s -j MASQUERADE", iptables_bin, inet_ntoa(*remote_ptp_ip));
+	}
+
+	if (ip_forward_state == 0) {
+		run_command("echo 0 > %s", PROC_IPV4_IP_FORWARD);
+	}
+} // clean_forwarding()
 
 int main(int argc, char **argv) {
 	int rc = 0;
 
 	// Parse program options
 	int opt = 0;
-	while ( (opt = getopt(argc, argv, "hfscn:H:P:u:o:a:b:x:rw:t:")) != -1)
+	while ( (opt = getopt(argc, argv, "hfscin:H:P:u:o:a:b:x:rw:t:")) != -1)
 	switch (opt) {
 		case 'h': print_help(argv[0]); break;
+
 		case 'f': opt_foreground = 1; break;
 
 		case 's': case 'c':
@@ -746,6 +841,7 @@ int main(int argc, char **argv) {
 			};
 			break;
 
+		case 'i': opt_invert_roles = 1; break;
 		case 'H': opt_ssh_host = optarg; break;
 		case 'P': opt_ssh_port = atoi(optarg); break;
 		case 'u': opt_ssh_user = optarg; break;
@@ -828,6 +924,22 @@ int main(int argc, char **argv) {
 		return 1;
 	};
 
+	for (const char **t = iptables_search; *t; t++) {
+		if (0 == access(*t, R_OK | X_OK)) { iptables_bin = *t; break; }
+	}
+	if (!iptables_bin) {
+		fprintf(stderr,"Can't found 'iptables' executable !\n");
+		return 1;
+	}
+
+	for (const char **t = ip_search; *t; t++) {
+		if (0 == access(*t, R_OK | X_OK)) { ip_bin = *t; break; }
+	}
+	if (!ip_bin) {
+		fprintf(stderr,"Can't found 'ip' executable !\n");
+		return 1;
+	}
+
 main_retry:
 	// Init libssh2 library
 	rc = libssh2_init(0);
@@ -863,10 +975,13 @@ main_retry:
 		if (channel_buffer) free(channel_buffer);
 		return 1;
 	};
-	if (0 != run_command("/sbin/ip link set %s up", tc.tun_name)) {
+	if (0 != run_command("%s link set %s up", ip_bin, tc.tun_name)) {
 		fprintf(stderr, "error up tun iface\n");
 		goto exit_tun;
 	};
+
+	// Save system IPv4 forward mode
+	ip_forward_state = get_ipv4_forward();
 
 	// Set IP for local tun iface
 	struct in_addr local_ptp_ip = tun_ptp_subnet;
@@ -878,7 +993,7 @@ main_retry:
 		local_ptp_ip.s_addr += ntohl(2);
 		remote_ptp_ip.s_addr += ntohl(1);
 	};
-	if (0 != run_command("/sbin/ip address add %s/30 dev %s",
+	if (0 != run_command("%s address add %s/30 dev %s", ip_bin,
 		inet_ntoa(local_ptp_ip), tc.tun_name)
 	) {
 		fprintf(stderr, "error set ip address on tun iface\n");
@@ -900,16 +1015,16 @@ main_retry:
 				1 == sscanf(ssh_remote_addr, "%s", remote_ssh_ip)
 				&& get_default_gateway(gw_ip)
 				&& strlen(gw_ip) > 0
-				&& -1 != asprintf(&client_default_route_delete_command,"/sbin/ip route del %s via %s", remote_ssh_ip, gw_ip)
+				&& -1 != asprintf(&client_default_route_delete_command,"%s route del %s via %s", ip_bin, remote_ssh_ip, gw_ip)
 			) {
 				if (
-					0 != run_command("/sbin/ip route add %s via %s",remote_ssh_ip, gw_ip)
+					0 != run_command("%s route add %s via %s", ip_bin, remote_ssh_ip, gw_ip)
 				) {
 					fprintf(stderr, "error set route to %s via %s gateway\n", remote_ssh_ip, gw_ip);
 					goto exit_tun_ip;
 				}
 
-				if (0 != run_command("/sbin/ip route add %s via %s",
+				if (0 != run_command("%s route add %s via %s", ip_bin,
 					"0/0", inet_ntoa(remote_ptp_ip))
 				) {
 					fprintf(stderr, "error set default route via tun iface\n");
@@ -926,7 +1041,7 @@ main_retry:
 			const char *rfc1918[] = {"10.0.0.0/8","172.16.0.0/12","192.168.0.0/16",NULL};
 			const char **net = rfc1918;
 			while (*net) {
-				if (0 != run_command("/sbin/ip route add %s via %s",
+				if (0 != run_command("%s route add %s via %s", ip_bin,
 					*net, inet_ntoa(remote_ptp_ip))
 				) {
 					fprintf(stderr, "error set route for %s via tun iface\n", *net);
@@ -942,7 +1057,7 @@ main_retry:
 			char subnet[128];
 			char *scp = opt_client_routes;
 			while (1 == sscanf(scp, "%s", subnet)) {
-				if (0 != run_command("/sbin/ip route add %s via %s",
+				if (0 != run_command("%s route add %s via %s", ip_bin,
 					subnet, inet_ntoa(remote_ptp_ip))
 				) {
 					fprintf(stderr, "error set route for %s via tun iface\n", subnet);
@@ -954,13 +1069,21 @@ main_retry:
 			}
 		}
 
+		// Prepare firewall for forwarding traffic
+		if (opt_invert_roles && prepare_forwarding(&remote_ptp_ip) != 0) goto exit_client_default_gw;
+
 		goto skip_server_ssh;
 	}
 
 	fprintf(stderr,"Work in server mode\n");
 
 	char *progname = strrchr(argv[0], '/');
-	if (-1 == asprintf(&vpncmd,"sudo -E %s -c -n %s", progname ? progname+1 : argv[0], opt_ptp_subnet)) {
+	if (-1 == asprintf(&vpncmd,"%s%s -c %s-n %s",
+		(strcmp(opt_ssh_user,"root") ? "sudo -E " : ""),
+		progname ? progname+1 : argv[0],
+		opt_invert_roles ? "-i ": "",
+		opt_ptp_subnet))
+	{
 		fprintf(stderr, "Can't create ssh run command\n");
 		goto exit_tun_ip;
 	}
@@ -1061,10 +1184,7 @@ main_retry:
 	}
 
 	// Prepare firewall for forwarding traffic
-	if (0 != run_command("/usr/sbin/iptables -I FORWARD -i %s ! -o %s -j ACCEPT",tc.tun_name,tc.tun_name)) goto exit_iptables;
-	if (0 != run_command("/usr/sbin/iptables -I FORWARD -o %s ! -i %s -j ACCEPT",tc.tun_name,tc.tun_name)) goto exit_iptables;
-	if (0 != run_command("/usr/sbin/iptables -t nat -I POSTROUTING -s %s -j MASQUERADE",inet_ntoa(remote_ptp_ip))) goto exit_iptables;
-	if (0 != run_command("echo 1 > /proc/sys/net/ipv4/ip_forward")) goto exit_iptables;
+	if (!opt_invert_roles && prepare_forwarding(&remote_ptp_ip) != 0) goto exit_iptables;
 
 	if (!opt_foreground) {
 		if (daemon(0, 0) != 0) {
@@ -1096,26 +1216,27 @@ skip_server_ssh:
 	}
 
 exit_iptables:
-	run_command("/usr/sbin/iptables -D FORWARD -i %s ! -o %s -j ACCEPT",tc.tun_name,tc.tun_name);
-	run_command("/usr/sbin/iptables -D FORWARD -o %s ! -i %s -j ACCEPT",tc.tun_name,tc.tun_name);
-	run_command("/usr/sbin/iptables -t nat -D POSTROUTING -s %s -j MASQUERADE",inet_ntoa(remote_ptp_ip));
-	//run_command("/usr/sbin/iptables -t nat -D POSTROUTING -i %s -j MASQUERADE",tc.tun_name);
-	run_command("echo 0 > /proc/sys/net/ipv4/ip_forward");
+	if (!opt_invert_roles) clean_forwarding(&remote_ptp_ip);
 
 exit_channel:
 	clean_ssh_channel(&sshconn);
 exit_ssh:
 	clean_ssh_session(&sshconn);
+
 exit_client_default_gw:
-	if (work_mode == WORK_MODE_CLIENT && client_default_route_delete_command) {
-		run_command("%s", client_default_route_delete_command);
-		free(client_default_route_delete_command);
+	if (work_mode == WORK_MODE_CLIENT) {
+		if (opt_invert_roles) clean_forwarding(&remote_ptp_ip);
+
+		if (client_default_route_delete_command) {
+			run_command("%s", client_default_route_delete_command);
+			free(client_default_route_delete_command);
+		}
 	}
 exit_tun_ip:
-	run_command("/sbin/ip address del %s/30 dev %s",
+	run_command("%s address del %s/30 dev %s", ip_bin,
 		inet_ntoa(local_ptp_ip), tc.tun_name);
 exit_tun_link:
-	run_command("/sbin/ip link set %s down", tc.tun_name);
+	run_command("%s link set %s down", ip_bin, tc.tun_name);
 exit_tun:
 	if (tun_buffer) { free(tun_buffer); tun_buffer = NULL; }
 	if (channel_buffer) { free(channel_buffer); channel_buffer = NULL; }
