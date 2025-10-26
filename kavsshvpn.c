@@ -38,6 +38,7 @@ History:
         * option for invert forwarding roles (for work as classic VPN then
           you connect to server, because in our terms SSH server you connected
           to is a "client")
+   2025-10-26 - Add parameter -d to activate coredump (as `ulimit -c unlimited`)
 ///////////////////////////////////////////////////////
 */
 
@@ -62,6 +63,7 @@ History:
 #include <libssh2.h>
 
 #ifndef PRODUCTION
+#include <sys/resource.h>
 #define TRACE fprintf(stderr,"TRACE %s:%d - %s()\n", __FILE__, __LINE__, __func__);
 #define DEBUG(...) fprintf(stderr, __VA_ARGS__);
 #else
@@ -376,6 +378,7 @@ enum work_mode_en {
 	WORK_MODE_CLIENT,
 } work_mode = WORK_MODE_UNKNOWN;
 
+int opt_unlimited_coredumps = 0;
 char *opt_ptp_subnet = NULL;
 struct in_addr tun_ptp_subnet;
 char *opt_ssh_host = NULL;
@@ -815,7 +818,7 @@ int main(int argc, char **argv) {
 
 	// Parse program options
 	int opt = 0;
-	while ( (opt = getopt(argc, argv, "hfscin:H:P:u:o:a:b:x:rw:t:")) != -1)
+	while ( (opt = getopt(argc, argv, "hfscin:H:P:u:o:a:b:dx:rw:t:")) != -1)
 	switch (opt) {
 		case 'h': print_help(argv[0]); break;
 
@@ -848,6 +851,7 @@ int main(int argc, char **argv) {
 		case 'o': opt_ssh_password = optarg; break;
 		case 'a': opt_ssh_pubkey = optarg; break;
 		case 'b': opt_ssh_privkey = optarg; break;
+		case 'd': opt_unlimited_coredumps = 1; break;
 		case 'x': opt_ssh_keypass = optarg; break;
 		case 'r': opt_server_permanent = 1; break;
 
@@ -911,6 +915,20 @@ int main(int argc, char **argv) {
 			"Use: sudo %s\n", argv[0]);
 		return 1;
 	};
+
+	if (opt_unlimited_coredumps) {
+#ifndef PRODUCTION
+		struct rlimit coredump = {
+			.rlim_cur = RLIM_INFINITY,
+			.rlim_max = RLIM_INFINITY
+		};
+		if (0 != setrlimit(RLIMIT_CORE, &coredump)) {
+			fprintf(stderr, "WARNING: Can't set unlimited RLIMIT_CORE: %s\n", strerror(errno));
+		}
+#else
+		fprintf(stderr, "INFO: -d parameter not work in production version\n");
+#endif
+	}
 
 	if (!opt_ssh_user) {
 		// TODO
@@ -1078,11 +1096,12 @@ main_retry:
 	fprintf(stderr,"Work in server mode\n");
 
 	char *progname = strrchr(argv[0], '/');
-	if (-1 == asprintf(&vpncmd,"%s%s -c %s-n %s",
+	if (-1 == asprintf(&vpncmd,"%s%s -c %s-n %s%s",
 		(strcmp(opt_ssh_user,"root") ? "sudo -E " : ""),
 		progname ? progname+1 : argv[0],
 		opt_invert_roles ? "-i ": "",
-		opt_ptp_subnet))
+		opt_ptp_subnet,
+		opt_unlimited_coredumps ? " -d":""))
 	{
 		fprintf(stderr, "Can't create ssh run command\n");
 		goto exit_tun_ip;
