@@ -25,6 +25,7 @@ Usage: ./kavsshvpn [options]
 	-f - foreground mode (daemonize by default)
 	-s - work as server (connect to remote ssh)
 	-c - work as client
+	-i - invert roles (client in forwarding mode)
 	-n <subnet> - tun p-t-p /30 subnet (example: 10.254.254.0)
 	-H <ip> - ssh host (example: 181.67.121.32)
 	-P <port> - ssh port (default 22)
@@ -101,8 +102,13 @@ Clone and build:
 ```shell
 $ git clone https://github.com/KuzinAndrey/kavsshvpn.git
 $ cd kavsshvpn
-$ ./build.sh prod
+$ make
 $ cp ./kavsshvpn /bin/kavsshvpn
+```
+
+To build with DEBUG info for `gdb` use:
+```
+DEBUG=1 make
 ```
 
 ## sudo configuration
