@@ -392,6 +392,7 @@ char *opt_ssh_keypass = NULL;
 int opt_foreground = 0;
 int opt_server_permanent = 0;
 int opt_server_retry_wait = 15;
+int retry_count = 0;
 
 int opt_client_route_default = 0;
 int opt_client_route_rfc1918 = 0;
@@ -958,7 +959,6 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
-main_retry:
 	// Init libssh2 library
 	rc = libssh2_init(0);
 	if (rc) {
@@ -1094,7 +1094,6 @@ main_retry:
 	}
 
 	fprintf(stderr,"Work in server mode\n");
-
 	char *progname = strrchr(argv[0], '/');
 	if (-1 == asprintf(&vpncmd,"%s%s -c %s-n %s%s",
 		(strcmp(opt_ssh_user,"root") ? "sudo -E " : ""),
@@ -1146,6 +1145,7 @@ main_retry:
 	if (opt_ssh_privkey) sshconn.privkey = strdup(opt_ssh_privkey);
 	if (opt_ssh_keypass) sshconn.keypass = strdup(opt_ssh_keypass);
 
+retry_ssh_server:
 	if (0 != up_ssh_session(&sshconn)) {
 		fprintf(stderr,"error create ssh session\n");
 		clean_ssh_session(&sshconn);
@@ -1206,13 +1206,15 @@ main_retry:
 	if (!opt_invert_roles && prepare_forwarding(&remote_ptp_ip) != 0) goto exit_iptables;
 
 	if (!opt_foreground) {
-		if (daemon(0, 0) != 0) {
+		if (!retry_count && daemon(0, 0) != 0) {
 			fprintf(stderr,"Can't daemonize process!\n");
 			goto exit_iptables;
 		};
 	} else {
 		fprintf(stderr,"Work in foreground mode (press Ctrl+C for break)\n");
 	}
+
+	retry_count++;
 
 skip_server_ssh:
 	signal(SIGINT, signal_handler);
@@ -1242,6 +1244,15 @@ exit_channel:
 exit_ssh:
 	clean_ssh_session(&sshconn);
 
+	if (
+		work_mode == WORK_MODE_SERVER
+		&& opt_server_permanent
+		&& program_state != 3
+	) {
+		if (opt_server_retry_wait > 0) sleep(opt_server_retry_wait);
+		goto retry_ssh_server;
+	}
+
 exit_client_default_gw:
 	if (work_mode == WORK_MODE_CLIENT) {
 		if (opt_invert_roles) clean_forwarding(&remote_ptp_ip);
@@ -1263,17 +1274,6 @@ exit_tun:
 	down_tun_iface(&tc);
 
 	libssh2_exit();
-
-	if (
-		work_mode == WORK_MODE_SERVER
-		&& opt_server_permanent
-		&& program_state != 3
-	) {
-		// TODO refactor permanent mode, restart only SSH session
-		// and don't touch tun and ip/route/iptables
-		if (opt_server_retry_wait > 0) sleep(opt_server_retry_wait);
-		goto main_retry;
-	}
 
 	if (opt_client_routes) { free(opt_client_routes); opt_client_routes = NULL; }
 	return 0;
