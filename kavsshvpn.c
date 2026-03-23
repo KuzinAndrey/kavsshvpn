@@ -77,6 +77,7 @@ History:
 #endif
 
 #define MAX_TRY 10
+#define SLEEP_TRY 10
 #define LIMIT_CYCLE_TRIES if (try < MAX_TRY) try++; else break;
 
 int program_state = 0; // 2 - exit
@@ -171,6 +172,8 @@ static int ssh_waitsocket(libssh2_socket_t socket_fd, LIBSSH2_SESSION *session)
 
 void clean_ssh_session(struct ssh_session *sess) {
 	if (!sess) return;
+
+	syslog(LOG_INFO, "Clean SSH session with %s", sess->server_ip ? sess->server_ip : "[null]");
 
 	if (sess->session) {
 		libssh2_session_disconnect(sess->session, "Normal Shutdown");
@@ -373,6 +376,7 @@ defer:
 } // run_command()
 
 void signal_handler(int sig) {
+	syslog(LOG_INFO,"catch signal %d", sig);
 	switch (sig) {
 		case SIGINT:
 		case SIGTERM:
@@ -500,7 +504,7 @@ int client_work(struct tun_connection *conn) {
 			packet_size = n + sizeof(pos); // packet size for write to ssh channel
 
 			pos = 0;
-			while (packet_size - pos > 0 && 1 == program_state) {
+			while ((packet_size - pos > 0) && 1 == program_state) {
 				nw = fwrite(tun_buffer + pos, 1, packet_size - pos, stdout);
 				if (nw == 0 && ferror(stdout)) return -__LINE__;
 				pos += nw;
@@ -555,6 +559,7 @@ int client_work(struct tun_connection *conn) {
 				if (n < 0) {
 					if ( errno == EINTR || errno == EAGAIN ) {
 						LIMIT_CYCLE_TRIES
+						usleep(SLEEP_TRY);
 						continue;
 					}
 					return -__LINE__;
@@ -567,7 +572,10 @@ int client_work(struct tun_connection *conn) {
 				}
 			} // if can read
 		} // state == 1
-		if (try == MAX_TRY) break;
+		if (try == MAX_TRY) {
+			syslog(LOG_ERR, "try max at %d", __LINE__);
+			break;
+		}
 
 		try = 0;
 		while (2 == channel_state && 1 == program_state) { // write packet to tun
@@ -576,6 +584,7 @@ int client_work(struct tun_connection *conn) {
 			if (n < 0) {
 				if ( errno == EINTR || errno == EAGAIN ) {
 					LIMIT_CYCLE_TRIES
+					usleep(SLEEP_TRY);
 					continue;
 				}
 				return -__LINE__;
@@ -588,7 +597,10 @@ int client_work(struct tun_connection *conn) {
 				channel_packet_size = 0;
 			}
 		} // state == 2
-		if (try == MAX_TRY) break;
+		if (try == MAX_TRY) {
+			syslog(LOG_ERR, "try max at %d", __LINE__);
+			break;
+		}
 	} // while
 
 	return 0;
@@ -631,18 +643,22 @@ int server_work(struct tun_connection *conn, struct ssh_session *sess) {
 			pos = 0;
 			packet_size = n + sizeof(pos); // packet size for write to ssh channel
 			try = 0;
-			while (packet_size - pos > 0 && 1 == program_state) {
+			while ((packet_size - pos > 0) && 1 == program_state) {
 				n = libssh2_channel_write(sess->channel,
 					tun_buffer + pos, packet_size - pos);
-				if (n == 0 || n == LIBSSH2_ERROR_EAGAIN) {
+				if (n == LIBSSH2_ERROR_EAGAIN) {
 					LIMIT_CYCLE_TRIES
+					usleep(SLEEP_TRY);
 					continue;
 				}
 				else if (n < 0) return -__LINE__;
 				pos += n;
 				try = 0;
 			}
-			if (try == MAX_TRY) break;
+			if (try == MAX_TRY) {
+				syslog(LOG_ERR, "try max %d", __LINE__);
+				break;
+			}
 		} // if tun can read
 
 		// READ FROM SSH CHANNEL
@@ -650,7 +666,7 @@ int server_work(struct tun_connection *conn, struct ssh_session *sess) {
 			n = libssh2_channel_read(sess->channel,
 				(char *)(&channel_packet_size) + channel_state_pos,
 				sizeof(channel_packet_size) - channel_state_pos);
-			if (n == 0 || n == LIBSSH2_ERROR_EAGAIN) {
+			if (n == LIBSSH2_ERROR_EAGAIN) {
 				continue;
 			} else if (n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
 				break;
@@ -686,7 +702,7 @@ int server_work(struct tun_connection *conn, struct ssh_session *sess) {
 				channel_packet_size - channel_state_pos);
 			if (n == 0 || n == LIBSSH2_ERROR_EAGAIN) {
 				LIMIT_CYCLE_TRIES
-				usleep(10);
+				usleep(SLEEP_TRY);
 				continue;
 			} else if (n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
 				break;
@@ -701,7 +717,10 @@ int server_work(struct tun_connection *conn, struct ssh_session *sess) {
 				channel_state_pos = 0;
 			}
 		} // state == 1
-		if (try == MAX_TRY) break;
+		if (try == MAX_TRY) {
+			syslog(LOG_ERR, "try max at %d", __LINE__);
+			break;
+		}
 		if (n < 0 && libssh2_channel_eof(sess->channel)) break;
 
 		try = 0;
@@ -711,6 +730,7 @@ int server_work(struct tun_connection *conn, struct ssh_session *sess) {
 			if (n < 0) {
 				if ( errno == EINTR || errno == EAGAIN ) {
 					LIMIT_CYCLE_TRIES
+					usleep(SLEEP_TRY);
 					continue;
 				}
 				return -__LINE__;
@@ -723,7 +743,10 @@ int server_work(struct tun_connection *conn, struct ssh_session *sess) {
 				channel_packet_size = 0;
 			}
 		} // state == 2
-		if (try == MAX_TRY) break;
+		if (try == MAX_TRY) {
+			syslog(LOG_ERR, "try max at %d", __LINE__);
+			break;
+		}
 	} // while
 
 	return 0;
@@ -1264,15 +1287,11 @@ skip_server_ssh:
 	// Main work cycle
 	if (work_mode == WORK_MODE_CLIENT) {
 		rc = client_work(&tc);
-		if (rc < 0) {
-			syslog(LOG_ERR,"%s() end work with code %d", "client_work", rc);
-		}
+		syslog(LOG_ERR,"%s() end work with code %d", "client_work", rc);
 		goto exit_client_default_gw;
 	} else {
 		rc = server_work(&tc, &sshconn);
-		if (rc < 0) {
-			syslog(LOG_ERR,"%s() end work with code %d", "server_work", rc);
-		}
+		syslog(LOG_ERR,"%s() end work with code %d", "server_work", rc);
 	}
 
 exit_iptables:
@@ -1288,7 +1307,11 @@ exit_ssh:
 		&& opt_server_permanent
 		&& program_state != 3
 	) {
-		if (opt_server_retry_wait > 0) sleep(opt_server_retry_wait);
+		if (opt_server_retry_wait > 0) {
+			syslog(LOG_INFO, "Wait %d seconds before retry connection", opt_server_retry_wait);
+			sleep(opt_server_retry_wait);
+		}
+		syslog(LOG_INFO, "Retry connection to %s", opt_ssh_host);
 		goto retry_ssh_server;
 	}
 
