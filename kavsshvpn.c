@@ -76,7 +76,7 @@ History:
 #define LIBSSH2_HOSTKEY_HASH_SHA1_LEN 20
 #endif
 
-#define MAX_TRY 10
+#define MAX_TRY 100
 #define SLEEP_TRY 10
 #define LIMIT_CYCLE_TRIES if (try < MAX_TRY) try++; else break;
 
