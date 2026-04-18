@@ -837,19 +837,29 @@ int get_ipv4_forward() {
 } // get_ipv4_forward()
 
 int prepare_forwarding(struct in_addr *remote_ptp_ip) {
-	if (0 != run_command("%s -I FORWARD -i %s ! -o %s -j ACCEPT",
-		iptables_bin, tc.tun_name, tc.tun_name)) return 1;
-
-	if (0 != run_command("%s -I FORWARD -o %s ! -i %s -j ACCEPT",
-		iptables_bin, tc.tun_name, tc.tun_name)) return 1;
-
+	if (0 != run_command("%s -C FORWARD -i %s ! -o %s -j ACCEPT 2> /dev/null",
+		iptables_bin, tc.tun_name, tc.tun_name)) {
+		if (0 != run_command("%s -I FORWARD -i %s ! -o %s -j ACCEPT",
+			iptables_bin, tc.tun_name, tc.tun_name)) return 1;
+	}
+	if (0 != run_command("%s -C FORWARD -o %s ! -i %s -j ACCEPT 2> /dev/null",
+		iptables_bin, tc.tun_name, tc.tun_name)) {
+		if (0 != run_command("%s -I FORWARD -o %s ! -i %s -j ACCEPT",
+			iptables_bin, tc.tun_name, tc.tun_name)) return 1;
+	}
 	if (opt_invert_roles) {
 		// client is router
-		if (0 != run_command("%s -t nat -I POSTROUTING ! -o %s -j MASQUERADE",
-			iptables_bin, tc.tun_name)) return 1;
+		if (0 != run_command("%s -t nat -C POSTROUTING ! -o %s -j MASQUERADE 2> /dev/null",
+			iptables_bin, tc.tun_name)) {
+			if (0 != run_command("%s -t nat -I POSTROUTING ! -o %s -j MASQUERADE",
+				iptables_bin, tc.tun_name)) return 1;
+		}
 	} else {
-		if (0 != run_command("%s -t nat -I POSTROUTING -s %s -j MASQUERADE",
-			iptables_bin, inet_ntoa(*remote_ptp_ip))) return 1;
+		if (0 != run_command("%s -t nat -C POSTROUTING -s %s -j MASQUERADE 2> /dev/null",
+			iptables_bin, inet_ntoa(*remote_ptp_ip))) {
+			if (0 != run_command("%s -t nat -I POSTROUTING -s %s -j MASQUERADE",
+				iptables_bin, inet_ntoa(*remote_ptp_ip))) return 1;
+		}
 	}
 
 	if (ip_forward_state == 0) {
