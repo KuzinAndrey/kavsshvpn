@@ -31,6 +31,9 @@ CFLAGS += $(shell pkg-config libssh2 --cflags)
 $(PROJ): $(OBJS)
 	$(CC) $(BUILD) $(OBJS) $(PROD) -o $@ $(LIBS)
 
+install: $(PROJ)
+	cp -v $(PROJ) /bin/
+
 clean:
 	rm -f $(PROJ) *.o
 
