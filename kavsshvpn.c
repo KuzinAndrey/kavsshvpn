@@ -1125,6 +1125,28 @@ int main(int argc, char **argv) {
 		local_ptp_ip.s_addr += ntohl(2);
 		remote_ptp_ip.s_addr += ntohl(1);
 	};
+
+	// Kill previously runned client for that IP if server reconnect
+	if (work_mode == WORK_MODE_CLIENT) {
+		FILE *fpid = NULL;
+		char pidpath[128] = {0};
+		snprintf(pidpath, sizeof(pidpath), "/run/kavsshvpn_%s", inet_ntoa(local_ptp_ip));
+		fpid = fopen(pidpath, "r");
+		if (fpid) {
+			pid_t killpid;
+			if (1 == fscanf(fpid, "%d", &killpid)) {
+				kill(killpid, SIGKILL);
+				sleep(2);
+			}
+			fclose(fpid);
+		}
+		fpid = fopen(pidpath, "w");
+		if (fpid) {
+			fprintf(fpid, "%d\n", getpid());
+			fclose(fpid);
+		}
+	}
+
 	if (0 != run_command("%s address add %s/30 dev %s", ip_bin,
 		inet_ntoa(local_ptp_ip), tc.tun_name)
 	) {
