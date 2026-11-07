@@ -903,7 +903,6 @@ char *escape_for_shell(const char *input) {
 	char* escaped = malloc(max_len);
 	if (!escaped) return NULL;
 	char* dst = escaped;
-	*dst++ = '\''; // Open outer single quote
 	while (*input) {
 		if (*input == '\'') {
 			// Replace ' with '\''
@@ -916,7 +915,6 @@ char *escape_for_shell(const char *input) {
 		}
 		input++;
 	}
-	*dst++ = '\''; // Close outer single quote
 	*dst = '\0';   // Null terminate
 	return escaped;
 }
@@ -1216,14 +1214,16 @@ int main(int argc, char **argv) {
 
 	fprintf(stderr,"Work in server mode\n");
 	char *progname = strrchr(argv[0], '/');
-	if (-1 == asprintf(&vpncmd,"%s%s -c %s-n %s%s%s%s",
+	if (-1 == asprintf(&vpncmd,"%s%s -c %s-n %s%s"
+		"%s%s%s", // client exec
 		(strcmp(opt_ssh_user,"root") ? "sudo -E " : ""),
 		progname ? progname+1 : argv[0],
 		opt_invert_roles ? "-i ": "",
 		opt_ptp_subnet,
 		opt_unlimited_coredumps ? " -d":"",
-		opt_client_exec ? " -e ":"",
-		opt_client_exec ? opt_client_exec:""
+		opt_client_exec ? " -e '":"",
+		opt_client_exec ? opt_client_exec:"",
+		opt_client_exec ? "'":""
 	)) {
 		fprintf(stderr, "Can't create ssh run command\n");
 		goto exit_tun_ip;
