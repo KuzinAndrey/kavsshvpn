@@ -416,6 +416,7 @@ int opt_client_route_rfc1918 = 0;
 char *opt_client_routes = NULL;
 size_t opt_client_routes_count = 0;
 char *client_default_route_delete_command = NULL;
+char *opt_client_exec = NULL;
 
 const char *session_start_sign = "ReAdy-SeT-Go!\n";
 struct tun_connection tc = {0};
@@ -779,6 +780,7 @@ void print_help(const char *prog) {
 	printf("\t-r - permanent connection (retry after error)\n");
 	printf("\t-w <sec> - wait between retry (default 15 sec)\n");
 	printf("\t-t <subnet>|default|rfc1918 - add route on client\n");
+	printf("\t-e <cmd> - run shell command on client after connect\n");
 	exit(0);
 } // print_help()
 
@@ -893,12 +895,38 @@ void clean_forwarding(struct in_addr *remote_ptp_ip) {
 	}
 } // clean_forwarding()
 
+// Dynamically allocates a shell-safe version of the input argument
+char *escape_for_shell(const char *input) {
+	// In worst-case scenario, each char is a single quote which becomes '\'' (4 chars)
+	// plus 2 bytes for outer enclosing single quotes, plus 1 for null-terminator.
+	size_t max_len = strlen(input) * 4 + 3;
+	char* escaped = malloc(max_len);
+	if (!escaped) return NULL;
+	char* dst = escaped;
+	*dst++ = '\''; // Open outer single quote
+	while (*input) {
+		if (*input == '\'') {
+			// Replace ' with '\''
+			*dst++ = '\'';
+			*dst++ = '\\';
+			*dst++ = '\'';
+			*dst++ = '\'';
+		} else {
+			*dst++ = *input;
+		}
+		input++;
+	}
+	*dst++ = '\''; // Close outer single quote
+	*dst = '\0';   // Null terminate
+	return escaped;
+}
+
 int main(int argc, char **argv) {
 	int rc = 0;
 
 	// Parse program options
 	int opt = 0;
-	while ( (opt = getopt(argc, argv, "hfscqin:H:P:u:o:a:b:dx:rw:t:")) != -1)
+	while ( (opt = getopt(argc, argv, "hfscqin:H:P:u:o:a:b:dx:rw:t:e:")) != -1)
 	switch (opt) {
 		case 'h': print_help(argv[0]); break;
 
@@ -970,6 +998,10 @@ int main(int argc, char **argv) {
 					}
 				}
 			}
+			break;
+
+		case 'e':
+			opt_client_exec = escape_for_shell(optarg);
 			break;
 
 		case '?':
@@ -1174,18 +1206,25 @@ int main(int argc, char **argv) {
 		// Prepare firewall for forwarding traffic
 		if (opt_invert_roles && prepare_forwarding(&remote_ptp_ip) != 0) goto exit_client_default_gw;
 
+		if (opt_client_exec) {
+			if (0 != run_command("%s", opt_client_exec))
+				goto exit_client_default_gw;
+		}
+
 		goto skip_server_ssh;
 	}
 
 	fprintf(stderr,"Work in server mode\n");
 	char *progname = strrchr(argv[0], '/');
-	if (-1 == asprintf(&vpncmd,"%s%s -c %s-n %s%s",
+	if (-1 == asprintf(&vpncmd,"%s%s -c %s-n %s%s%s%s",
 		(strcmp(opt_ssh_user,"root") ? "sudo -E " : ""),
 		progname ? progname+1 : argv[0],
 		opt_invert_roles ? "-i ": "",
 		opt_ptp_subnet,
-		opt_unlimited_coredumps ? " -d":""))
-	{
+		opt_unlimited_coredumps ? " -d":"",
+		opt_client_exec ? " -e ":"",
+		opt_client_exec ? opt_client_exec:""
+	)) {
 		fprintf(stderr, "Can't create ssh run command\n");
 		goto exit_tun_ip;
 	}
@@ -1362,5 +1401,6 @@ exit_tun:
 	libssh2_exit();
 
 	if (opt_client_routes) { free(opt_client_routes); opt_client_routes = NULL; }
+	if (opt_client_exec) { free(opt_client_exec); opt_client_exec = NULL; }
 	return 0;
 } // main()
