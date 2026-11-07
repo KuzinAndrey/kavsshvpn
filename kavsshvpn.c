@@ -392,6 +392,7 @@ enum work_mode_en {
 	WORK_MODE_UNKNOWN = 0,
 	WORK_MODE_SERVER,
 	WORK_MODE_CLIENT,
+	WORK_MODE_TUNNEL,
 } work_mode = WORK_MODE_UNKNOWN;
 
 int opt_unlimited_coredumps = 0;
@@ -482,6 +483,9 @@ int client_work(struct tun_connection *conn) {
 	// send SIGN to server for detect session start
 	fprintf(stdout, "%s", session_start_sign);
 	fflush(stdout);
+
+	int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+	fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
 	while (1 == program_state) {
 		// READ FROM TUN
@@ -762,6 +766,7 @@ void print_help(const char *prog) {
 	printf("\t-f - foreground mode (daemonize by default)\n");
 	printf("\t-s - work as server (connect to remote ssh)\n");
 	printf("\t-c - work as client\n");
+	printf("\t-q - work as tunnel (without iptables rules)\n");
 	printf("\t-i - invert roles (client in forwarding mode)\n");
 	printf("\t-n <subnet> - tun p-t-p /30 subnet (example: 10.254.254.0)\n");
 	printf("\t-H <ip> - ssh host (example: 181.67.121.32)\n");
@@ -837,6 +842,8 @@ int get_ipv4_forward() {
 } // get_ipv4_forward()
 
 int prepare_forwarding(struct in_addr *remote_ptp_ip) {
+	if (work_mode == WORK_MODE_TUNNEL) return 0;
+
 	if (0 != run_command("%s -C FORWARD -i %s ! -o %s -j ACCEPT 2> /dev/null",
 		iptables_bin, tc.tun_name, tc.tun_name)) {
 		if (0 != run_command("%s -I FORWARD -i %s ! -o %s -j ACCEPT",
@@ -870,6 +877,8 @@ int prepare_forwarding(struct in_addr *remote_ptp_ip) {
 } // prepare_forwarding()
 
 void clean_forwarding(struct in_addr *remote_ptp_ip) {
+	if (work_mode == WORK_MODE_TUNNEL) return;
+
 	run_command("%s -D FORWARD -i %s ! -o %s -j ACCEPT", iptables_bin, tc.tun_name, tc.tun_name);
 	run_command("%s -D FORWARD -o %s ! -i %s -j ACCEPT", iptables_bin, tc.tun_name, tc.tun_name);
 
@@ -889,21 +898,23 @@ int main(int argc, char **argv) {
 
 	// Parse program options
 	int opt = 0;
-	while ( (opt = getopt(argc, argv, "hfscin:H:P:u:o:a:b:dx:rw:t:")) != -1)
+	while ( (opt = getopt(argc, argv, "hfscqin:H:P:u:o:a:b:dx:rw:t:")) != -1)
 	switch (opt) {
 		case 'h': print_help(argv[0]); break;
 
 		case 'f': opt_foreground = 1; break;
 
-		case 's': case 'c':
+		case 's': case 'c': case 'q':
 			if (work_mode != WORK_MODE_UNKNOWN) {
 				fprintf(stderr,"You can't use several work mode in one process\n");
 				return 1;
 			} else {
 				if (opt == 's')
 					work_mode = WORK_MODE_SERVER;
-				else
+				else if (opt == 'c')
 					work_mode = WORK_MODE_CLIENT;
+				else if (opt == 'q')
+					work_mode = WORK_MODE_TUNNEL;
 			};
 			break;
 
@@ -973,9 +984,9 @@ int main(int argc, char **argv) {
 			"Use: \"%s -s\" for server mode\n"
 			"\"%s -c\" for client mode\n", argv[0], argv[0]);
 		return 1;
-	} else if (work_mode == WORK_MODE_SERVER) {
+	} else if (work_mode == WORK_MODE_SERVER || work_mode == WORK_MODE_TUNNEL) {
 		if (!opt_ssh_host) {
-			fprintf(stderr,"SSH host and port (optionally) needed for server work mode!\n"
+			fprintf(stderr,"SSH host and port (optionally) needed for server/tunnel work mode!\n"
 				"Use: \"%s -s ... -H <host> -P <port> ...\"", argv[0]);
 			return 1;
 		};
@@ -1029,6 +1040,9 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
+	// Ignore SIGPIPE for don't halt on SSH session close
+	signal(SIGPIPE, SIG_IGN);
+
 	// Init libssh2 library
 	rc = libssh2_init(0);
 	if (rc) {
@@ -1074,7 +1088,7 @@ int main(int argc, char **argv) {
 	// Set IP for local tun iface
 	struct in_addr local_ptp_ip = tun_ptp_subnet;
 	struct in_addr remote_ptp_ip = tun_ptp_subnet;
-	if (work_mode == WORK_MODE_SERVER) {
+	if (work_mode == WORK_MODE_SERVER || work_mode == WORK_MODE_TUNNEL) {
 		local_ptp_ip.s_addr += ntohl(1);
 		remote_ptp_ip.s_addr += ntohl(2);
 	} else {
@@ -1224,7 +1238,7 @@ retry_ssh_server:
 
 	if (0 != up_ssh_channel(&sshconn)) goto exit_ssh;
 
-	fprintf(stderr, "Try run SSH: %s", vpncmd);
+	fprintf(stderr, "Try run SSH: %s\n", vpncmd);
 	while (( rc = libssh2_channel_exec(sshconn.channel, vpncmd)) == LIBSSH2_ERROR_EAGAIN) {
 		fprintf(stderr, ".");
 		if (-1 == ssh_waitsocket(sshconn.sock, sshconn.session)) break;
@@ -1313,7 +1327,7 @@ exit_ssh:
 	clean_ssh_session(&sshconn);
 
 	if (
-		work_mode == WORK_MODE_SERVER
+		(work_mode == WORK_MODE_SERVER || work_mode == WORK_MODE_TUNNEL)
 		&& opt_server_permanent
 		&& program_state != 3
 	) {
