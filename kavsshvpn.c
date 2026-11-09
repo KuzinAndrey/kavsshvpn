@@ -51,6 +51,7 @@ History:
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <signal.h>
 #include <fcntl.h>
@@ -462,6 +463,7 @@ char *opt_ssh_keypass = NULL;
 int opt_foreground = 0;
 int opt_server_permanent = 0;
 int opt_server_retry_wait = 15;
+int opt_tun_liveness = 1; // 1 = ICMP liveness probes to peer (default on; -l disables)
 int retry_count = 0;
 
 int opt_client_route_default = 0;
@@ -511,6 +513,163 @@ const char *ip_search[] = {
 
 
 ///////////////////////////////////////////////////////
+// ICMP LIVENESS (PTP peer over the TUN)
+//
+// SSH keepalives only prove the server<->sshd path is alive: a frozen or
+// dead client process (or a lost peer TUN) keeps the SSH session healthy
+// while the tunnel is dead. An ICMP echo to the PTP peer travels the full
+// data path (tun -> pump -> channel -> sshd -> pump -> tun) and catches
+// exactly that. Probes go out only while the link is idle, at the same
+// cadence as the SSH keepalive.
+/////////////////////////////////////////////////////
+
+#define LIVENESS_GRACE_MS    30 * 1000 // no probes right after session start
+#define LIVENESS_IDLE_MS     30 * 1000 // probe only after this much no-traffic
+#define LIVENESS_INTERVAL_MS 30 * 1000 // probe period while idle
+#define LIVENESS_TIMEOUT_MS  5 * 1000  // wait for one reply
+#define LIVENESS_MAX_FAILS   2         // unanswered probes in a row -> dead
+
+struct icmp_liveness {
+	int sock;
+	struct in_addr peer;
+	uint32_t id;
+	uint32_t seq;
+	int pending;
+	struct timeval sent;
+	struct timeval last_data;
+	struct timeval last_probe;
+	struct timeval armed_at;
+	int fails;
+};
+
+struct icmp_liveness icmp_lv = {0};
+
+static long long liveness_ms_diff(struct timeval *now, struct timeval *then) {
+	return (long long)(now->tv_sec - then->tv_sec) * 1000 +
+		(now->tv_usec - then->tv_usec) / 1000;
+}
+
+static void icmp_liveness_arm(struct icmp_liveness *lv) {
+	gettimeofday(&lv->last_data, NULL);
+	gettimeofday(&lv->armed_at, NULL);
+	lv->last_probe.tv_sec = 0;
+	lv->last_probe.tv_usec = 0;
+	lv->pending = 0;
+	lv->fails = 0;
+	lv->seq = 0;
+}
+
+static int icmp_liveness_init(struct icmp_liveness *lv, struct in_addr *peer) {
+	lv->peer = *peer;
+	lv->id = (uint32_t)getpid() & 0xffff;
+	lv->sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	if (lv->sock < 0) {
+		syslog(LOG_WARNING, "ICMP liveness disabled: %s", strerror(errno));
+		lv->sock = -1;
+		return -1;
+	}
+	int flags = fcntl(lv->sock, F_GETFL, 0);
+	fcntl(lv->sock, F_SETFL, flags | O_NONBLOCK);
+	icmp_liveness_arm(lv);
+	return 0;
+}
+
+static void icmp_liveness_close(struct icmp_liveness *lv) {
+	if (lv->sock >= 0) {
+		close(lv->sock);
+		lv->sock = -1;
+	}
+}
+
+// A real packet moved through the tunnel: it proves liveness better than
+// a probe could, so reset the counters.
+static void icmp_liveness_data(struct icmp_liveness *lv) {
+	if (lv->sock < 0) return;
+	gettimeofday(&lv->last_data, NULL);
+	lv->fails = 0;
+	lv->pending = 0;
+}
+
+// Send one echo request (8-byte header, no payload).
+static void icmp_liveness_send_probe(struct icmp_liveness *lv) {
+	unsigned char hdr[8] = {0};
+	hdr[0] = 8; // echo request
+	hdr[4] = (unsigned char)(lv->id >> 8);
+	hdr[5] = (unsigned char)(lv->id & 0xff);
+	hdr[6] = (unsigned char)(lv->seq >> 8);
+	hdr[7] = (unsigned char)(lv->seq & 0xff);
+	uint32_t sum = 0;
+	for (int i = 0; i < 4; i++)
+		sum += ((uint32_t)hdr[2 * i] << 8) | hdr[2 * i + 1];
+	sum = (sum >> 16) + (sum & 0xffff);
+	sum += sum >> 16;
+	hdr[2] = (unsigned char)(~sum >> 8);
+	hdr[3] = (unsigned char)(~sum & 0xff);
+
+	struct sockaddr_in dst = {0};
+	dst.sin_family = AF_INET;
+	dst.sin_addr = lv->peer;
+	int rc = sendto(lv->sock, hdr, sizeof(hdr), 0,
+		(struct sockaddr *)&dst, sizeof(dst));
+	// sendto() returns the bytes sent (8), not 0. Success = all 8 bytes went out.
+	if (rc == (ssize_t)sizeof(hdr)) {
+		lv->pending = 1;
+		gettimeofday(&lv->sent, NULL);
+		gettimeofday(&lv->last_probe, NULL);
+		lv->seq++;
+	}
+}
+
+// Consume a queued reply (non-blocking).
+static void icmp_liveness_recv(struct icmp_liveness *lv) {
+	if (lv->sock < 0 || !lv->pending) return;
+	unsigned char buf[128];
+	while (1) {
+		ssize_t n = recv(lv->sock, buf, sizeof(buf), 0);
+		if (n < 0) {
+			if (errno == EINTR) continue;
+			break;
+		}
+		if (n < 8) break;
+		uint16_t rid = (uint16_t)((buf[4] << 8) | buf[5]);
+		uint16_t rseq = (uint16_t)((buf[6] << 8) | buf[7]);
+		if (buf[0] == 0 && // echo reply
+			rid == (uint16_t)lv->id &&
+			rseq == (uint16_t)(lv->seq - 1)) {
+			lv->pending = 0;
+			lv->fails = 0;
+			gettimeofday(&lv->last_data, NULL);
+			return;
+		}
+	}
+}
+
+// Call once per loop iteration. Returns 1 when the peer is declared dead.
+static int icmp_liveness_tick(struct icmp_liveness *lv) {
+	if (lv->sock < 0) return 0;
+	struct timeval now;
+	gettimeofday(&now, NULL);
+
+	if (liveness_ms_diff(&now, &lv->armed_at) < LIVENESS_GRACE_MS) return 0;
+
+	if (lv->pending) {
+		if (liveness_ms_diff(&now, &lv->sent) > LIVENESS_TIMEOUT_MS) {
+			lv->pending = 0;
+			lv->fails++;
+			if (lv->fails >= LIVENESS_MAX_FAILS) return 1;
+		}
+		return 0; // wait out the in-flight probe
+	}
+
+	long long idle = liveness_ms_diff(&now, &lv->last_data);
+	long long since_probe = liveness_ms_diff(&now, &lv->last_probe);
+	if (idle > LIVENESS_IDLE_MS && since_probe > LIVENESS_INTERVAL_MS) {
+		icmp_liveness_send_probe(lv);
+	}
+	return 0;
+}
+
+/////////////////////////////////////////////////////
 // CLIENT/SERVER WORK
 ///////////////////////////////////////////////////////
 
@@ -543,9 +702,10 @@ int client_work(struct tun_connection *conn) {
 		FD_ZERO(&rfds);
 		FD_SET(STDIN_FILENO,&rfds);
 		FD_SET(conn->tun_fd,&rfds);
+		int maxfd = conn->tun_fd;
 		tv.tv_sec = 0; tv.tv_usec = 1000;
 
-		rc = select((conn->tun_fd + 1), &rfds, NULL, NULL, &tv);
+		rc = select((maxfd + 1), &rfds, NULL, NULL, &tv);
 		if (rc < 0) {
 			if ( errno == EINTR || errno == EAGAIN ) continue;
 			return -__LINE__;
@@ -661,7 +821,16 @@ int server_work(struct tun_connection *conn, struct ssh_session *sess) {
 	fd_set wfds;
 	struct timeval tv;
 
+	// (Re)arm liveness for this session: the peer TUN is up (start sign seen).
+	icmp_liveness_arm(&icmp_lv);
+
 	while (1 == program_state) {
+		if (icmp_liveness_tick(&icmp_lv)) {
+			syslog(LOG_ERR, "ICMP liveness: peer %s unresponsive, closing session",
+				inet_ntoa(icmp_lv.peer));
+			break;
+		}
+
 		// READ FROM TUN
 		FD_ZERO(&rfds);
 		FD_ZERO(&wfds);
@@ -673,6 +842,11 @@ int server_work(struct tun_connection *conn, struct ssh_session *sess) {
 		max = sess->sock;
 		FD_SET(conn->tun_fd,&rfds);
 		if (max < conn->tun_fd) max = conn->tun_fd;
+		// Only watch the raw socket while a probe is in flight (see client_work).
+		if (icmp_lv.sock >= 0 && icmp_lv.pending) {
+			FD_SET(icmp_lv.sock, &rfds);
+			if (max < icmp_lv.sock) max = icmp_lv.sock;
+		}
 		tv.tv_sec = 0; tv.tv_usec = 1000;
 		rc = select((max + 1), &rfds, &wfds, NULL, &tv);
 		if (rc < 0) {
@@ -682,6 +856,8 @@ int server_work(struct tun_connection *conn, struct ssh_session *sess) {
 
 		// Incoming socket data may carry WINDOW_ADJUST — the window may have changed.
 		if (rc && FD_ISSET(sess->sock, &rfds)) tx_stalled = 0;
+		if (rc && icmp_lv.sock >= 0 && FD_ISSET(icmp_lv.sock, &rfds))
+			icmp_liveness_recv(&icmp_lv);
 
 		if (rc && FD_ISSET(conn->tun_fd, &rfds)) {
 			if (tx_pos < tx_size) {
@@ -752,6 +928,7 @@ int server_work(struct tun_connection *conn, struct ssh_session *sess) {
 			} else if (n < 0) return -__LINE__;
 			else {
 				channel_state_pos += n;
+				icmp_liveness_data(&icmp_lv);
 				if (sizeof(channel_packet_size) - channel_state_pos == 0) {
 					// after read packet size prepare to read whole packet
 					channel_state = 1;
@@ -788,6 +965,7 @@ int server_work(struct tun_connection *conn, struct ssh_session *sess) {
 			} else if (n < 0) return -__LINE__;
 			else {
 				channel_state_pos += n;
+				icmp_liveness_data(&icmp_lv);
 				if (channel_packet_size - channel_state_pos == 0) {
 					channel_state = 2; // write packet to tun mode
 					channel_state_pos = 0;
@@ -837,6 +1015,7 @@ void print_help(const char *prog) {
 	printf("\t-x <password> - private key password\n");
 	printf("\t-r - permanent connection (retry after error)\n");
 	printf("\t-w <sec> - wait between retry (default 15 sec)\n");
+	printf("\t-l - disable tunnel liveness ICMP check (on by default)\n");
 	printf("\t-t <subnet>|default|rfc1918 - add route on client\n");
 	printf("\t-e <cmd> - run shell command on client after connect\n");
 	exit(0);
@@ -982,7 +1161,7 @@ int main(int argc, char **argv) {
 
 	// Parse program options
 	int opt = 0;
-	while ( (opt = getopt(argc, argv, "hfscqin:H:P:u:o:a:b:dx:rw:t:e:")) != -1)
+	while ( (opt = getopt(argc, argv, "hfscqin:H:P:u:o:a:b:dx:rw:t:e:l")) != -1)
 	switch (opt) {
 		case 'h': print_help(argv[0]); break;
 
@@ -1020,6 +1199,7 @@ int main(int argc, char **argv) {
 		case 'd': opt_unlimited_coredumps = 1; break;
 		case 'x': opt_ssh_keypass = optarg; break;
 		case 'r': opt_server_permanent = 1; break;
+		case 'l': opt_tun_liveness = 0; break;
 
 		case 'w':
 			opt_server_retry_wait = atoi(optarg);
@@ -1228,6 +1408,14 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "error set ip address on tun iface\n");
 		goto exit_tun_link;
 	};
+
+	// PTP link is up: start idle ICMP liveness probes to the peer. Only the
+	// server probes (a client would only be able to exit anyway); disabled by
+	// -l. No-op if a raw socket cannot be created.
+	if (work_mode == WORK_MODE_SERVER && opt_tun_liveness)
+		icmp_liveness_init(&icmp_lv, &remote_ptp_ip);
+	else
+		icmp_lv.sock = -1;
 
 	if (work_mode == WORK_MODE_CLIENT) {
 		// If we want change default gw, we must save current route to SSH connected client
@@ -1497,6 +1685,7 @@ exit_tun_ip:
 exit_tun_link:
 	run_command("%s link set %s down", ip_bin, tc.tun_name);
 exit_tun:
+	icmp_liveness_close(&icmp_lv);
 	if (tun_buffer) { free(tun_buffer); tun_buffer = NULL; }
 	if (channel_buffer) { free(channel_buffer); channel_buffer = NULL; }
 	if (vpncmd) { free(vpncmd); vpncmd = NULL; }
