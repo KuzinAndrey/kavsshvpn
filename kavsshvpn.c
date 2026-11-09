@@ -78,7 +78,7 @@ History:
 
 #define MAX_TRY 100
 #define SLEEP_TRY 10
-#define LIMIT_CYCLE_TRIES if (try < MAX_TRY) try++; else break;
+#define LIMIT_CYCLE_TRIES if (try < MAX_TRY) try++; else { syslog(LOG_ERR,"limit try %d",__LINE__); break; }
 
 int program_state = 0; // 2 - exit
 int run_command(const char *fmt, ...);
@@ -467,12 +467,10 @@ int client_work(struct tun_connection *conn) {
 	ssize_t n;
 	size_t packet_size;
 	size_t pos;
-	size_t nw;
 
 	int channel_state = 0; // 0 - read packet size, 1 - read packet
 	size_t channel_packet_size = 0;
 	size_t channel_state_pos = 0;
-	size_t try;
 
 	// we need send info about packet length in ssh stream (reserve at buffer start size_t space)
 	char *adj_buffer = tun_buffer + sizeof(packet_size);
@@ -489,12 +487,18 @@ int client_work(struct tun_connection *conn) {
 	fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
 	while (1 == program_state) {
-		// READ FROM TUN
 		FD_ZERO(&rfds);
+		FD_SET(STDIN_FILENO,&rfds);
 		FD_SET(conn->tun_fd,&rfds);
 		tv.tv_sec = 0; tv.tv_usec = 1000;
+
 		rc = select((conn->tun_fd + 1), &rfds, NULL, NULL, &tv);
-		if ( -1 == rc ) return -__LINE__;
+		if (rc < 0) {
+			if ( errno == EINTR || errno == EAGAIN ) continue;
+			return -__LINE__;
+		}
+
+		// READ FROM TUN
 		if (rc && FD_ISSET(conn->tun_fd, &rfds)) {
 			n = read(conn->tun_fd, adj_buffer, adj_buffer_size);
 			if (n < 0) {
@@ -510,21 +514,18 @@ int client_work(struct tun_connection *conn) {
 
 			pos = 0;
 			while ((packet_size - pos > 0) && 1 == program_state) {
-				nw = fwrite(tun_buffer + pos, 1, packet_size - pos, stdout);
-				if (nw == 0 && ferror(stdout)) return -__LINE__;
-				pos += nw;
+				n = write(STDOUT_FILENO, tun_buffer + pos, packet_size - pos);
+				if (n < 0) {
+					if ( errno == EINTR || errno == EAGAIN ) continue;
+				} else if (n == 0) return -__LINE__;
+				pos += n;
 			}
-			fflush(stdout);
 		} // if tun can read
 
 		// READ FROM STDIN
-		if (0 == channel_state) { // read packet size
-			FD_ZERO(&rfds);
-			FD_SET(STDIN_FILENO,&rfds);
-			tv.tv_sec = 0; tv.tv_usec = 1000;
-			rc = select((STDIN_FILENO + 1), &rfds, NULL, NULL, &tv);
-			if ( -1 == rc ) return -__LINE__;
-			if (rc && FD_ISSET(STDIN_FILENO, &rfds)) {
+		if (rc && FD_ISSET(STDIN_FILENO, &rfds)) {
+			// read packet size
+			if (0 == channel_state && 1 == program_state) {
 				n = read(STDIN_FILENO, (char *)&channel_packet_size + channel_state_pos,
 					sizeof(channel_packet_size) - channel_state_pos);
 				if (n < 0) {
@@ -534,7 +535,7 @@ int client_work(struct tun_connection *conn) {
 				channel_state_pos += n;
 
 				if (channel_state_pos == sizeof(channel_packet_size)) {
-					channel_state = 1; // read packet
+					channel_state = 1;
 					channel_state_pos = 0;
 					channel_packet_size = ntohl(channel_packet_size);
 					// adjust buffer size
@@ -548,76 +549,49 @@ int client_work(struct tun_connection *conn) {
 						channel_buffer_size = channel_packet_size;
 					}
 				}
-			} // if can read
-		}
+			} // channel_state == 0
 
-		try = 0;
-		while (1 == channel_state && 1 == program_state) { // read packet content
-			FD_ZERO(&rfds);
-			FD_SET(STDIN_FILENO,&rfds);
-			tv.tv_sec = 0; tv.tv_usec = 1000;
-			rc = select((STDIN_FILENO + 1), &rfds, NULL, NULL, &tv);
-			if ( -1 == rc ) return -__LINE__;
-			if (rc && FD_ISSET(STDIN_FILENO, &rfds)) {
+			// read packet content
+			if (1 == channel_state && 1 == program_state) {
 				n = read(STDIN_FILENO, channel_buffer + channel_state_pos,
 					channel_packet_size - channel_state_pos);
 				if (n < 0) {
-					if ( errno == EINTR || errno == EAGAIN ) {
-						LIMIT_CYCLE_TRIES
-						usleep(SLEEP_TRY);
-						continue;
-					}
+					if ( errno == EINTR || errno == EAGAIN ) continue;
 					return -__LINE__;
 				} else if (n == 0) return -__LINE__;
 				channel_state_pos += n;
-				try = 0;
 				if (channel_state_pos == channel_packet_size) {
-					channel_state = 2; // write packet to tun
+					channel_state = 2;
 					channel_state_pos = 0;
 				}
-			} // if can read
-		} // state == 1
-		if (try == MAX_TRY) {
-			syslog(LOG_ERR, "try max at %d", __LINE__);
-			break;
-		}
+			} // channel_state == 1
+		} // stdin can read
 
-		try = 0;
-		while (2 == channel_state && 1 == program_state) { // write packet to tun
+		// write packet to tun
+		if (2 == channel_state && 1 == program_state) {
 			n = write(conn->tun_fd, channel_buffer + channel_state_pos,
 				channel_packet_size - channel_state_pos);
 			if (n < 0) {
-				if ( errno == EINTR || errno == EAGAIN ) {
-					LIMIT_CYCLE_TRIES
-					usleep(SLEEP_TRY);
-					continue;
-				}
+				if ( errno == EINTR || errno == EAGAIN ) continue;
 				return -__LINE__;
 			};
 			channel_state_pos += n;
-			try = 0;
 			if (channel_packet_size - channel_state_pos == 0) {
 				channel_state = 0; // read packet size mode
 				channel_state_pos = 0;
 				channel_packet_size = 0;
 			}
-		} // state == 2
-		if (try == MAX_TRY) {
-			syslog(LOG_ERR, "try max at %d", __LINE__);
-			break;
-		}
+		} // channel_state == 2
 	} // while
 
 	return 0;
 } // client_work()
 
 int server_work(struct tun_connection *conn, struct ssh_session *sess) {
-	int rc;
+	int rc, max;
 	ssize_t n;
 
 	size_t packet_size;
-	size_t pos;
-	size_t try;
 
 	int channel_state = 0; // 0 - read packet size, 1 - read packet
 	size_t channel_packet_size = 0;
@@ -627,131 +601,162 @@ int server_work(struct tun_connection *conn, struct ssh_session *sess) {
 	char *adj_buffer = tun_buffer + sizeof(packet_size);
 	size_t adj_buffer_size = tun_buffer_size - sizeof(packet_size);
 
+	size_t tx_pos = 0;
+	size_t tx_size = 0;
+	int tx_stalled = 0; // 1 = channel window exhausted, wait for WINDOW_ADJUST
 	fd_set rfds;
+	fd_set wfds;
 	struct timeval tv;
 
 	while (1 == program_state) {
 		// READ FROM TUN
 		FD_ZERO(&rfds);
+		FD_ZERO(&wfds);
+		FD_SET(sess->sock,&rfds);
+		// Wait for writability only while the channel window can accept data.
+		// While stalled on the window, TCP writability is meaningless — wait for
+		// readability (WINDOW_ADJUST / incoming data) instead.
+		if (tx_pos < tx_size && !tx_stalled) FD_SET(sess->sock, &wfds);
+		max = sess->sock;
 		FD_SET(conn->tun_fd,&rfds);
+		if (max < conn->tun_fd) max = conn->tun_fd;
 		tv.tv_sec = 0; tv.tv_usec = 1000;
-		rc = select((conn->tun_fd + 1), &rfds, NULL, NULL, &tv);
-		if ( -1 == rc ) return -__LINE__;
+		rc = select((max + 1), &rfds, &wfds, NULL, &tv);
+		if (rc < 0) {
+			if (errno == EINTR || errno == EAGAIN) continue;
+			return -__LINE__;
+		}
+
+		// Incoming socket data may carry WINDOW_ADJUST — the window may have changed.
+		if (rc && FD_ISSET(sess->sock, &rfds)) tx_stalled = 0;
+
 		if (rc && FD_ISSET(conn->tun_fd, &rfds)) {
-			n = read(conn->tun_fd, adj_buffer, adj_buffer_size);
-			if (n <= 0) return -__LINE__;
+			if (tx_pos < tx_size) {
+				// A TUN packet is still being sent through SSH; do not overwrite tun_buffer.
+			} else {
+				n = read(conn->tun_fd, adj_buffer, adj_buffer_size);
+				if (n < 0) {
+					if (errno == EINTR || errno == EAGAIN) continue;
+					return -__LINE__;
+				} else if (n == 0) return -__LINE__;
 
-			// save info about packet size
-			pos = htonl(n);
-			memcpy(tun_buffer, &pos, sizeof(size_t));
+				// save info about packet length in ssh stream
+				size_t hdr = htonl((uint32_t)n);
+				memcpy(tun_buffer, &hdr, sizeof(hdr));
 
-			pos = 0;
-			packet_size = n + sizeof(pos); // packet size for write to ssh channel
-			try = 0;
-			while ((packet_size - pos > 0) && 1 == program_state) {
-				n = libssh2_channel_write(sess->channel,
-					tun_buffer + pos, packet_size - pos);
-				if (n == LIBSSH2_ERROR_EAGAIN) {
-					LIMIT_CYCLE_TRIES
-					usleep(SLEEP_TRY);
-					continue;
-				}
-				else if (n < 0) return -__LINE__;
-				pos += n;
-				try = 0;
-			}
-			if (try == MAX_TRY) {
-				syslog(LOG_ERR, "try max %d", __LINE__);
-				break;
+				tx_pos = 0;
+				tx_size = (size_t)n + sizeof(hdr);
+				tx_stalled = 0;
 			}
 		} // if tun can read
 
+		if (tx_pos < tx_size) {
+			size_t stall = 0;
+			while (tx_pos < tx_size && 1 == program_state) {
+				n = libssh2_channel_write(sess->channel,
+					tun_buffer + tx_pos, (unsigned int)(tx_size - tx_pos));
+				if (n == LIBSSH2_ERROR_EAGAIN) {
+					if (tx_stalled || stall >= MAX_TRY) break;
+					stall++;
+					usleep(SLEEP_TRY);
+					continue;
+				} else if (n == 0) {
+					if (libssh2_channel_eof(sess->channel)) {
+						n = -1;
+						break;
+					}
+				} else if (n < 0) {
+					return -__LINE__;
+				} else {
+					tx_pos += (size_t)n;
+					tx_stalled = 0;
+					stall = 0;
+					if (tx_pos == tx_size) {
+						tx_pos = 0;
+						tx_size = 0;
+					}
+				}
+			}
+			if (n == LIBSSH2_ERROR_EAGAIN) tx_stalled = 1;
+			if (n < 0 && libssh2_channel_eof(sess->channel)) break;
+		}
+
 		// READ FROM SSH CHANNEL
+		n = 0;
 		if (0 == channel_state && 1 == program_state) { // read packet size from ssh channel
 			n = libssh2_channel_read(sess->channel,
 				(char *)(&channel_packet_size) + channel_state_pos,
 				sizeof(channel_packet_size) - channel_state_pos);
 			if (n == LIBSSH2_ERROR_EAGAIN) {
-				continue;
-			} else if (n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
-				break;
-			} else if (n < 0) {
-				// TODO error log
-				return -__LINE__;
-			}
-			channel_state_pos += n;
-			if (sizeof(channel_packet_size) - channel_state_pos == 0) {
-				// after read packet size prepare to read whole packet
-				channel_state = 1;
-				channel_state_pos = 0;
-				channel_packet_size = ntohl(channel_packet_size);
-
-				// adjust buffer size
-				if (channel_packet_size > channel_buffer_size) {
-					char *r = realloc(channel_buffer, channel_packet_size);
-					if (!r) {
-						// TODO no memory log
-						return -__LINE__;
-					}
-					channel_buffer = r;
-					channel_buffer_size = channel_packet_size;
+				// No data yet; fall through so the TUN write below still runs.
+			} else if (n == 0) {
+				if (libssh2_channel_eof(sess->channel)) {
+					n = -1;
+					break;
 				}
-			} // if readed
-		} // if state == 0
-		if (n < 0 && libssh2_channel_eof(sess->channel)) break;
-
-		try = 0;
-		while (1 == channel_state && 1 == program_state) { // read packet from ssh channel
-			n = libssh2_channel_read(sess->channel,
-				channel_buffer + channel_state_pos,
-				channel_packet_size - channel_state_pos);
-			if (n == 0 || n == LIBSSH2_ERROR_EAGAIN) {
-				LIMIT_CYCLE_TRIES
-				usleep(SLEEP_TRY);
-				continue;
 			} else if (n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
 				break;
-			} else if (n < 0) {
-				// TODO error log
-				return -__LINE__;
+			} else if (n < 0) return -__LINE__;
+			else {
+				channel_state_pos += n;
+				if (sizeof(channel_packet_size) - channel_state_pos == 0) {
+					// after read packet size prepare to read whole packet
+					channel_state = 1;
+					channel_state_pos = 0;
+					channel_packet_size = ntohl(channel_packet_size);
+
+					// adjust buffer size
+					if (channel_packet_size > channel_buffer_size) {
+						char *r = realloc(channel_buffer, channel_packet_size);
+						if (!r) {
+							// TODO no memory log
+							return -__LINE__;
+						}
+						channel_buffer = r;
+						channel_buffer_size = channel_packet_size;
+					}
+				} // if readed
 			}
-			channel_state_pos += n;
-			try = 0;
-			if (channel_packet_size - channel_state_pos == 0) {
-				channel_state = 2; // write packet to tun mode
-				channel_state_pos = 0;
+		} // if state == 0
+
+		if (1 == channel_state && 1 == program_state) { // read packet from ssh channel
+			n = libssh2_channel_read(sess->channel,
+						channel_buffer + channel_state_pos,
+						channel_packet_size - channel_state_pos);
+			if (n == LIBSSH2_ERROR_EAGAIN) {
+				// No data yet; fall through so the TUN write below still runs.
+			} else if (n == 0) {
+				if (libssh2_channel_eof(sess->channel)) {
+					n = -1;
+					break;
+				}
+			} else if (n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
+				break;
+			} else if (n < 0) return -__LINE__;
+			else {
+				channel_state_pos += n;
+				if (channel_packet_size - channel_state_pos == 0) {
+					channel_state = 2; // write packet to tun mode
+					channel_state_pos = 0;
+				}
 			}
 		} // state == 1
-		if (try == MAX_TRY) {
-			syslog(LOG_ERR, "try max at %d", __LINE__);
-			break;
-		}
 		if (n < 0 && libssh2_channel_eof(sess->channel)) break;
 
-		try = 0;
-		while (2 == channel_state && 1 == program_state) { // write packet to tun
+		if (2 == channel_state && 1 == program_state) { // write packet to tun
 			n = write(conn->tun_fd, channel_buffer + channel_state_pos,
 				channel_packet_size - channel_state_pos);
 			if (n < 0) {
-				if ( errno == EINTR || errno == EAGAIN ) {
-					LIMIT_CYCLE_TRIES
-					usleep(SLEEP_TRY);
-					continue;
-				}
+				if (errno == EINTR || errno == EAGAIN) continue;
 				return -__LINE__;
-			};
+			}
 			channel_state_pos += n;
-			try = 0;
 			if (channel_packet_size - channel_state_pos == 0) {
 				channel_state = 0; // read packet size mode
 				channel_state_pos = 0;
 				channel_packet_size = 0;
 			}
 		} // state == 2
-		if (try == MAX_TRY) {
-			syslog(LOG_ERR, "try max at %d", __LINE__);
-			break;
-		}
 	} // while
 
 	return 0;
