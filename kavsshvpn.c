@@ -59,6 +59,7 @@ History:
 
 #include <net/if.h>
 #include <linux/if_tun.h>
+#include <linux/tcp.h>
 #include <arpa/inet.h>
 
 #include <libssh2.h>
@@ -78,6 +79,7 @@ History:
 
 #define MAX_TRY 100
 #define SLEEP_TRY 10
+#define MAX_WAIT_RETRY 60 // ~1.1s per wait, ~66s max for handshake/auth/exec
 #define LIMIT_CYCLE_TRIES if (try < MAX_TRY) try++; else { syslog(LOG_ERR,"limit try %d",__LINE__); break; }
 
 int program_state = 0; // 2 - exit
@@ -218,6 +220,14 @@ int up_ssh_session(struct ssh_session *sess) {
 		goto return_error;
 	}
 
+	// Detect silently dropped connections: fail after 90s of unacked data
+	// instead of waiting for the TCP retransmission timeout (~15-30 min).
+	{
+		int user_timeout_ms = 90 * 1000;
+		setsockopt(sess->sock, IPPROTO_TCP, TCP_USER_TIMEOUT,
+			&user_timeout_ms, sizeof(user_timeout_ms));
+	}
+
 	sess->sin.sin_port = htons(sess->port);
 	if (connect(sess->sock, (struct sockaddr*)(&sess->sin), sizeof(struct sockaddr_in))) {
 		fprintf(stderr, "Can't make tcp connection to %s:%d - %s\n",
@@ -235,8 +245,17 @@ int up_ssh_session(struct ssh_session *sess) {
 	libssh2_session_set_blocking(sess->session, 0); // non-blocking mode
 	libssh2_keepalive_config(sess->session, 1, 30);
 
-	while ((rc = libssh2_session_handshake(sess->session, sess->sock)) ==
-		LIBSSH2_ERROR_EAGAIN);
+	{
+		int wait_try = 0;
+		while ((rc = libssh2_session_handshake(sess->session, sess->sock)) ==
+			LIBSSH2_ERROR_EAGAIN) {
+			if (wait_try++ >= MAX_WAIT_RETRY) {
+				fprintf(stderr,"SSH handshake timeout\n");
+				goto return_error;
+			}
+			ssh_waitsocket(sess->sock, sess->session);
+		}
+	}
 	if (rc) {
 		fprintf(stderr,"Can't make ssh handshake - %d.\n", rc);
 		goto return_error;
@@ -255,14 +274,21 @@ int up_ssh_session(struct ssh_session *sess) {
 	fprintf(stderr,"\n");
 
 	char *userauthlist = NULL;
-	do {
-		userauthlist = libssh2_userauth_list(sess->session, sess->user, strlen(sess->user));
-		if (userauthlist ||
-			LIBSSH2_ERROR_EAGAIN != libssh2_session_last_error(
-				sess->session, NULL, NULL, 0)) break;
+	{
+		int wait_try = 0;
+		do {
+			userauthlist = libssh2_userauth_list(sess->session, sess->user, strlen(sess->user));
+			if (userauthlist ||
+				LIBSSH2_ERROR_EAGAIN != libssh2_session_last_error(
+					sess->session, NULL, NULL, 0)) break;
 
-		ssh_waitsocket(sess->sock, sess->session);
-	} while(1);
+			if (wait_try++ >= MAX_WAIT_RETRY) {
+				fprintf(stderr,"SSH auth methods list timeout\n");
+				goto return_error;
+			}
+			ssh_waitsocket(sess->sock, sess->session);
+		} while(1);
+	}
 	if (!userauthlist) {
 		fprintf(stderr,"Can't get SSH auth methods list for user \"%s\".\n", sess->user);
 		goto return_error;
@@ -272,17 +298,35 @@ int up_ssh_session(struct ssh_session *sess) {
 
 	if (strstr(userauthlist, "publickey") && sess->pubkey && sess->privkey) {
 		fprintf(stderr, "Auth as \"%s\" by public key: %s\n", sess->user, sess->pubkey);
-		while ((rc = libssh2_userauth_publickey_fromfile(sess->session,
-			sess->user, sess->pubkey, sess->privkey, sess->keypass))
-			== LIBSSH2_ERROR_EAGAIN) {};
+		{
+			int wait_try = 0;
+			while ((rc = libssh2_userauth_publickey_fromfile(sess->session,
+				sess->user, sess->pubkey, sess->privkey, sess->keypass))
+				== LIBSSH2_ERROR_EAGAIN) {
+				if (wait_try++ >= MAX_WAIT_RETRY) {
+					fprintf(stderr,"SSH publickey auth timeout\n");
+					goto return_error;
+				}
+				ssh_waitsocket(sess->sock, sess->session);
+			}
+		}
 		if (rc) {
 			fprintf(stderr,"Auth by public key failed.\n");
 			goto return_error;
 		}
 	} else if (strstr(userauthlist, "password") && sess->password) {
 		fprintf(stderr, "Auth as \"%s\" by password.\n", sess->user);
-		while ((rc = libssh2_userauth_password(sess->session, sess->user,
-			sess->password)) == LIBSSH2_ERROR_EAGAIN) {};
+		{
+			int wait_try = 0;
+			while ((rc = libssh2_userauth_password(sess->session,
+				sess->user, sess->password)) == LIBSSH2_ERROR_EAGAIN) {
+				if (wait_try++ >= MAX_WAIT_RETRY) {
+					fprintf(stderr,"SSH password auth timeout\n");
+					goto return_error;
+				}
+				ssh_waitsocket(sess->sock, sess->session);
+			}
+		}
 		if (rc) {
 			fprintf(stderr,"Auth by password failed.\n");
 			goto return_error;
@@ -296,8 +340,10 @@ int up_ssh_session(struct ssh_session *sess) {
 	return 0;
 
 return_error:
-	rc = libssh2_session_last_error(sess->session, &err, NULL, 0);
-	fprintf(stderr,"libssh2 error: %d - %s\n", rc, err);
+	if (sess->session) {
+		rc = libssh2_session_last_error(sess->session, &err, NULL, 0);
+		fprintf(stderr,"libssh2 error: %d - %s\n", rc, err);
+	}
 	clean_ssh_session(sess);
 	return 1;
 } // up_ssh_session()
@@ -332,14 +378,21 @@ int up_ssh_channel(struct ssh_session *sess) {
 	if (!sess) return 1;
 	if (!sess->session) return 1;
 
-	do {
-		sess->channel = libssh2_channel_open_session(sess->session);
-		if (sess->channel ||
-			LIBSSH2_ERROR_EAGAIN != libssh2_session_last_error(
-				sess->session, NULL, NULL, 0)) break;
+	{
+		int wait_try = 0;
+		do {
+			sess->channel = libssh2_channel_open_session(sess->session);
+			if (sess->channel ||
+				LIBSSH2_ERROR_EAGAIN != libssh2_session_last_error(
+					sess->session, NULL, NULL, 0)) break;
 
-		ssh_waitsocket(sess->sock, sess->session);
-	} while(1);
+			if (wait_try++ >= MAX_WAIT_RETRY) {
+				fprintf(stderr,"SSH channel open timeout\n");
+				return 1;
+			}
+			ssh_waitsocket(sess->sock, sess->session);
+		} while(1);
+	}
 
 	if (!sess->channel) {
 		char *err = NULL;
@@ -1096,6 +1149,55 @@ int main(int argc, char **argv) {
 	};
 
 	// Prepare tun variables
+	// Set IP for local tun iface
+	struct in_addr local_ptp_ip = tun_ptp_subnet;
+	struct in_addr remote_ptp_ip = tun_ptp_subnet;
+	if (work_mode == WORK_MODE_SERVER || work_mode == WORK_MODE_TUNNEL) {
+		local_ptp_ip.s_addr += ntohl(1);
+		remote_ptp_ip.s_addr += ntohl(2);
+	} else {
+		local_ptp_ip.s_addr += ntohl(2);
+		remote_ptp_ip.s_addr += ntohl(1);
+	};
+
+	// Kill previously runned client for that IP if server reconnect.
+	// Done before picking the TUN name so a reconnect reclaims the same tunN
+	// (the stale process's tun is released when it dies) and the interface
+	// name stays stable across reconnects.
+	if (work_mode == WORK_MODE_CLIENT) {
+		FILE *fpid = NULL;
+		char pidpath[128] = {0};
+		char procpath[128] = {0};
+		char cmdline[1024] = {0};
+		snprintf(pidpath, sizeof(pidpath), "/run/kavsshvpn_%s", inet_ntoa(local_ptp_ip));
+		fpid = fopen(pidpath, "r");
+		if (fpid) {
+			pid_t killpid = 0;
+			if (1 == fscanf(fpid, "%d", &killpid) && killpid > 0) {
+				// Only kill if the PID still belongs to a kavsshvpn process
+				// (PID may have been reused by an unrelated process).
+				snprintf(procpath, sizeof(procpath), "/proc/%d/cmdline", killpid);
+				FILE *fcl = fopen(procpath, "r");
+				if (fcl) {
+					size_t nread = fread(cmdline, 1, sizeof(cmdline) - 1, fcl);
+					fclose(fcl);
+					cmdline[nread] = '\0';
+					if (strstr(cmdline, "kavsshvpn")) {
+						kill(killpid, SIGKILL);
+						syslog(LOG_INFO, "Killed staled client process %d", (int)killpid);
+						sleep(2);
+					}
+				}
+			}
+			fclose(fpid);
+		}
+		fpid = fopen(pidpath, "w");
+		if (fpid) {
+			fprintf(fpid, "%d\n", getpid());
+			fclose(fpid);
+		}
+	}
+
 	char tun_iface[IFNAMSIZ];
 	int tun_number = 1;
 	while (1) { // find empty name for tun device
@@ -1119,38 +1221,6 @@ int main(int argc, char **argv) {
 
 	// Save system IPv4 forward mode
 	ip_forward_state = get_ipv4_forward();
-
-	// Set IP for local tun iface
-	struct in_addr local_ptp_ip = tun_ptp_subnet;
-	struct in_addr remote_ptp_ip = tun_ptp_subnet;
-	if (work_mode == WORK_MODE_SERVER || work_mode == WORK_MODE_TUNNEL) {
-		local_ptp_ip.s_addr += ntohl(1);
-		remote_ptp_ip.s_addr += ntohl(2);
-	} else {
-		local_ptp_ip.s_addr += ntohl(2);
-		remote_ptp_ip.s_addr += ntohl(1);
-	};
-
-	// Kill previously runned client for that IP if server reconnect
-	if (work_mode == WORK_MODE_CLIENT) {
-		FILE *fpid = NULL;
-		char pidpath[128] = {0};
-		snprintf(pidpath, sizeof(pidpath), "/run/kavsshvpn_%s", inet_ntoa(local_ptp_ip));
-		fpid = fopen(pidpath, "r");
-		if (fpid) {
-			pid_t killpid;
-			if (1 == fscanf(fpid, "%d", &killpid)) {
-				kill(killpid, SIGKILL);
-				sleep(2);
-			}
-			fclose(fpid);
-		}
-		fpid = fopen(pidpath, "w");
-		if (fpid) {
-			fprintf(fpid, "%d\n", getpid());
-			fclose(fpid);
-		}
-	}
 
 	if (0 != run_command("%s address add %s/30 dev %s", ip_bin,
 		inet_ntoa(local_ptp_ip), tc.tun_name)
@@ -1299,15 +1369,22 @@ retry_ssh_server:
 	if (0 != up_ssh_session(&sshconn)) {
 		fprintf(stderr,"error create ssh session\n");
 		clean_ssh_session(&sshconn);
-		goto exit_tun_ip;
+		goto exit_ssh; // let the retry check below decide (permanent mode retries)
 	}
 
 	if (0 != up_ssh_channel(&sshconn)) goto exit_ssh;
 
 	fprintf(stderr, "Try run SSH: %s\n", vpncmd);
-	while (( rc = libssh2_channel_exec(sshconn.channel, vpncmd)) == LIBSSH2_ERROR_EAGAIN) {
-		fprintf(stderr, ".");
-		if (-1 == ssh_waitsocket(sshconn.sock, sshconn.session)) break;
+	{
+		int wait_try = 0;
+		while (( rc = libssh2_channel_exec(sshconn.channel, vpncmd)) == LIBSSH2_ERROR_EAGAIN) {
+			fprintf(stderr, ".");
+			if (wait_try++ >= MAX_WAIT_RETRY) {
+				fprintf(stderr, "SSH exec timeout\n");
+				break;
+			}
+			if (-1 == ssh_waitsocket(sshconn.sock, sshconn.session)) break;
+		}
 	}
 	fprintf(stderr, "\n");
 	if (rc) {
