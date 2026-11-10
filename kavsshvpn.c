@@ -1175,6 +1175,44 @@ char *escape_for_shell(const char *input) {
 	return escaped;
 }
 
+// Slot path kept here so the exit path can remove the file.
+static char g_pidfile_path[128] = {0};
+
+// Kill a stale process holding this slot, then record our PID.
+static void pidfile_guard(struct in_addr local_ptp_ip) {
+	FILE *fpid = NULL;
+	char procpath[128] = {0};
+	char cmdline[1024] = {0};
+	snprintf(g_pidfile_path, sizeof(g_pidfile_path), "/run/%s_%s",
+		prog_name, inet_ntoa(local_ptp_ip));
+	fpid = fopen(g_pidfile_path, "r");
+	if (fpid) {
+		pid_t killpid = 0;
+		if (1 == fscanf(fpid, "%d", &killpid) && killpid > 0) {
+			// Only kill if the PID is still a kavsshvpn process (PID reuse).
+			snprintf(procpath, sizeof(procpath), "/proc/%d/cmdline", killpid);
+			FILE *fcl = fopen(procpath, "r");
+			if (fcl) {
+				size_t nread = fread(cmdline, 1, sizeof(cmdline) - 1, fcl);
+				fclose(fcl);
+				cmdline[nread] = '\0';
+				if (strstr(cmdline, prog_name)) {
+					kill(killpid, SIGKILL);
+					syslog(LOG_INFO, "Killed staled process %d (slot %s)",
+						(int)killpid, g_pidfile_path);
+					sleep(2);
+				}
+			}
+		}
+		fclose(fpid);
+	}
+	fpid = fopen(g_pidfile_path, "w");
+	if (fpid) {
+		fprintf(fpid, "%d\n", getpid());
+		fclose(fpid);
+	}
+}
+
 int main(int argc, char **argv) {
 	int rc = 0;
 
@@ -1374,43 +1412,8 @@ int main(int argc, char **argv) {
 		remote_ptp_ip.s_addr += ntohl(1);
 	};
 
-	// Kill previously runned client for that IP if server reconnect.
-	// Done before picking the TUN name so a reconnect reclaims the same tunN
-	// (the stale process's tun is released when it dies) and the interface
-	// name stays stable across reconnects.
-	if (work_mode == WORK_MODE_CLIENT) {
-		FILE *fpid = NULL;
-		char pidpath[128] = {0};
-		char procpath[128] = {0};
-		char cmdline[1024] = {0};
-		snprintf(pidpath, sizeof(pidpath), "/run/%s_%s", prog_name, inet_ntoa(local_ptp_ip));
-		fpid = fopen(pidpath, "r");
-		if (fpid) {
-			pid_t killpid = 0;
-			if (1 == fscanf(fpid, "%d", &killpid) && killpid > 0) {
-				// Only kill if the PID still belongs to a kavsshvpn process
-				// (PID may have been reused by an unrelated process).
-				snprintf(procpath, sizeof(procpath), "/proc/%d/cmdline", killpid);
-				FILE *fcl = fopen(procpath, "r");
-				if (fcl) {
-					size_t nread = fread(cmdline, 1, sizeof(cmdline) - 1, fcl);
-					fclose(fcl);
-					cmdline[nread] = '\0';
-					if (strstr(cmdline, prog_name)) {
-						kill(killpid, SIGKILL);
-						syslog(LOG_INFO, "Killed staled client process %d", (int)killpid);
-						sleep(2);
-					}
-				}
-			}
-			fclose(fpid);
-		}
-		fpid = fopen(pidpath, "w");
-		if (fpid) {
-			fprintf(fpid, "%d\n", getpid());
-			fclose(fpid);
-		}
-	}
+	// Kill any stale process for this slot, then record our PID.
+	pidfile_guard(local_ptp_ip);
 
 	char tun_iface[IFNAMSIZ];
 	int tun_number = 1;
@@ -1424,6 +1427,7 @@ int main(int argc, char **argv) {
 	// Up tun iface
 	if (-1 == up_tun_iface(&tc, tun_iface)) {
 		fprintf(stderr,"Can't create tun iface: %s\n", tun_iface);
+		if (g_pidfile_path[0]) unlink(g_pidfile_path);
 		if (tun_buffer) free(tun_buffer);
 		if (channel_buffer) free(channel_buffer);
 		return 1;
@@ -1720,6 +1724,7 @@ exit_tun_link:
 	run_command("%s link set %s down", ip_bin, tc.tun_name);
 exit_tun:
 	icmp_liveness_close(&icmp_lv);
+	if (g_pidfile_path[0]) unlink(g_pidfile_path);
 	if (tun_buffer) { free(tun_buffer); tun_buffer = NULL; }
 	if (channel_buffer) { free(channel_buffer); channel_buffer = NULL; }
 	if (vpncmd) { free(vpncmd); vpncmd = NULL; }
