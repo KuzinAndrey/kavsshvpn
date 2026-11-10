@@ -1216,6 +1216,10 @@ static void pidfile_guard(struct in_addr local_ptp_ip) {
 int main(int argc, char **argv) {
 	int rc = 0;
 
+	signal(SIGPIPE, SIG_IGN);
+	signal(SIGINT, signal_handler);
+	signal(SIGTERM, signal_handler);
+
 	// Remember our own name (basename of /proc/self/exe) so the pidfile and the
 	// stale-process check don't hardcode it. Falls back to the default if the
 	// readlink fails.
@@ -1379,9 +1383,6 @@ int main(int argc, char **argv) {
 		fprintf(stderr,"Can't found 'ip' executable !\n");
 		return 1;
 	}
-
-	// Ignore SIGPIPE for don't halt on SSH session close
-	signal(SIGPIPE, SIG_IGN);
 
 	// Init libssh2 library
 	rc = libssh2_init(0);
@@ -1672,10 +1673,7 @@ retry_ssh_server:
 	retry_count++;
 
 skip_server_ssh:
-	signal(SIGINT, signal_handler);
-	signal(SIGTERM, signal_handler);
-
-	program_state = 1; // start
+	if (program_state == 0) program_state = 1;
 
 	// Main work cycle
 	if (work_mode == WORK_MODE_CLIENT) {
