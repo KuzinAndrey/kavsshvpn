@@ -81,7 +81,6 @@ History:
 #define MAX_TRY 100
 #define SLEEP_TRY 10
 #define MAX_WAIT_RETRY 60 // ~1.1s per wait, ~66s max for handshake/auth/exec
-#define LIMIT_CYCLE_TRIES if (try < MAX_TRY) try++; else { syslog(LOG_ERR,"limit try %d",__LINE__); break; }
 
 int program_state = 0; // 2 - exit
 int run_command(const char *fmt, ...);
@@ -349,27 +348,43 @@ return_error:
 	return 1;
 } // up_ssh_session()
 
+// Bound for the channel close handshake, in ms. A live peer ACKs the close in
+// one round trip, so this is generous for the normal path; a frozen/dead peer
+// never ACKs, and this runs exactly on the reconnect path, so we must not let
+// it stall the retry for the old 100-iteration (~110 s) budget.
+#define CHANNEL_CLOSE_TIMEOUT_MS (5 * 1000)
+
+// Elapsed milliseconds since start.
+static long long ms_since(struct timeval *start) {
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	return (long long)(now.tv_sec - start->tv_sec) * 1000 +
+		(now.tv_usec - start->tv_usec) / 1000;
+}
+
 void clean_ssh_channel(struct ssh_session *sess) {
 	if (!sess || !sess->session || !sess->channel) return;
 	int rc;
-	size_t try;
-//	int exitcode;
+	struct timeval t0;
+	gettimeofday(&t0, NULL);
 
-	try = 0;
+	// Send EOF, bounded by the close budget.
 	while (( rc = libssh2_channel_send_eof(sess->channel)) == LIBSSH2_ERROR_EAGAIN) {
-		LIMIT_CYCLE_TRIES
-	}
-
-	try = 0;
-	while (( rc = libssh2_channel_close(sess->channel)) == LIBSSH2_ERROR_EAGAIN) {
-		LIMIT_CYCLE_TRIES
 		ssh_waitsocket(sess->sock, sess->session);
+		if (ms_since(&t0) > CHANNEL_CLOSE_TIMEOUT_MS) break;
 	}
 
-//	if (rc == 0) {
-//		exitcode = libssh2_channel_get_exit_status(sess->channel);
-//		// TODO ?
-//	}
+	// Close, bounded by the same budget. A frozen peer never confirms, so we
+	// give up after the budget and let the session teardown below drop the TCP
+	// connection instead of spinning ~110 s.
+	while (( rc = libssh2_channel_close(sess->channel)) == LIBSSH2_ERROR_EAGAIN) {
+		ssh_waitsocket(sess->sock, sess->session);
+		if (ms_since(&t0) > CHANNEL_CLOSE_TIMEOUT_MS) {
+			syslog(LOG_INFO, "Channel close timed out after %d ms (peer unresponsive); dropping connection",
+				CHANNEL_CLOSE_TIMEOUT_MS);
+			break;
+		}
+	}
 
 	libssh2_channel_free(sess->channel);
 	sess->channel = NULL;
