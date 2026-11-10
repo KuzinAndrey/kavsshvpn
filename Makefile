@@ -13,7 +13,7 @@ SOURCES = $(wildcard *.c)
 OBJS = $(patsubst %.c,%.o,$(SOURCES))
 LIBS =
 BUILD =
-CFLAGS = -Wall -Werror -Wextra -pedantic
+CFLAGS = -Wall -Werror -Wextra -pedantic -O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2
 
 ifdef DEBUG
   CFLAGS += -ggdb

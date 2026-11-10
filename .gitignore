@@ -1,3 +1,4 @@
 kavsshvpn
+*.o
 test*/*
 test_*.sh

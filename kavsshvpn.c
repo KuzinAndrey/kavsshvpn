@@ -82,7 +82,7 @@ History:
 #define SLEEP_TRY 10
 #define MAX_WAIT_RETRY 60 // ~1.1s per wait, ~66s max for handshake/auth/exec
 
-int program_state = 0; // 2 - exit
+volatile sig_atomic_t program_state = 0; // 2 - exit
 int run_command(const char *fmt, ...);
 
 ///////////////////////////////////////////////////////
@@ -901,6 +901,7 @@ int server_work(struct tun_connection *conn, struct ssh_session *sess) {
 
 		if (tx_pos < tx_size) {
 			size_t stall = 0;
+			n = 0;
 			while (tx_pos < tx_size && 1 == program_state) {
 				n = libssh2_channel_write(sess->channel,
 					tun_buffer + tx_pos, (unsigned int)(tx_size - tx_pos));
@@ -1036,6 +1037,7 @@ void print_help(const char *prog) {
 	printf("\t-r - permanent connection (retry after error)\n");
 	printf("\t-w <sec> - wait between retry (default 15 sec)\n");
 	printf("\t-l - disable tunnel liveness ICMP check (on by default)\n");
+	printf("\t-d - unlimited coredumps (non-production only)\n");
 	printf("\t-t <subnet>|default|rfc1918 - add route on client\n");
 	printf("\t-e <cmd> - run shell command on client after connect\n");
 	exit(0);
@@ -1280,8 +1282,8 @@ int main(int argc, char **argv) {
 
 		case 'w':
 			opt_server_retry_wait = atoi(optarg);
-			if (opt_server_retry_wait < 0) {
-				fprintf(stderr,"Value of -w parameter can't be negative\n");
+			if (opt_server_retry_wait < 1) {
+				fprintf(stderr,"Value of -w parameter must be >= 1\n");
 				return 1;
 			}
 			break;
@@ -1469,7 +1471,7 @@ int main(int argc, char **argv) {
 			char gw_ip[128];
 			char remote_ssh_ip[128];
 			if (
-				1 == sscanf(ssh_remote_addr, "%s", remote_ssh_ip)
+				1 == sscanf(ssh_remote_addr, "%127s", remote_ssh_ip)
 				&& get_default_gateway(gw_ip)
 				&& strlen(gw_ip) > 0
 				&& -1 != asprintf(&client_default_route_delete_command,"%s route del %s via %s", ip_bin, remote_ssh_ip, gw_ip)
@@ -1513,7 +1515,7 @@ int main(int argc, char **argv) {
 		if (opt_client_routes_count > 0) {
 			char subnet[128];
 			char *scp = opt_client_routes;
-			while (1 == sscanf(scp, "%s", subnet)) {
+			while (1 == sscanf(scp, "%127s", subnet)) {
 				if (0 != run_command("%s route add %s via %s", ip_bin,
 					subnet, inet_ntoa(remote_ptp_ip))
 				) {
@@ -1574,7 +1576,7 @@ int main(int argc, char **argv) {
 	if (opt_client_routes_count > 0) {
 		char subnet[128];
 		char *scp = opt_client_routes;
-		while (1 == sscanf(scp, "%s", subnet)) {
+		while (1 == sscanf(scp, "%127s", subnet)) {
 			vpncmdadd = realloc(vpncmd, vpncmdlen + strlen(" -t ") + strlen(subnet) + 1);
 			if (vpncmdadd) {
 				vpncmdlen += sprintf(vpncmdadd + vpncmdlen, " -t %s", subnet);
