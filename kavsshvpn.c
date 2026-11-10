@@ -353,6 +353,7 @@ return_error:
 // never ACKs, and this runs exactly on the reconnect path, so we must not let
 // it stall the retry for the old 100-iteration (~110 s) budget.
 #define CHANNEL_CLOSE_TIMEOUT_MS (5 * 1000)
+#define START_SIGN_TIMEOUT_MS (30 * 1000)
 
 // Elapsed milliseconds since start.
 static long long ms_since(struct timeval *start) {
@@ -1623,6 +1624,8 @@ retry_ssh_server:
 	ssize_t nread;
 	int find_client_sign = 0;
 	const char *sign_pos = session_start_sign;
+	struct timeval sign_t0;
+	gettimeofday(&sign_t0, NULL);
 
 	do {
 		nread = libssh2_channel_read(sshconn.channel,
@@ -1645,6 +1648,10 @@ retry_ssh_server:
 		} else {
 			if (nread == LIBSSH2_ERROR_EAGAIN) {
 				if (-1 == ssh_waitsocket(sshconn.sock, sshconn.session)) break;
+				if (ms_since(&sign_t0) > START_SIGN_TIMEOUT_MS) {
+					syslog(LOG_ERR, "Start sign timeout after %d ms", START_SIGN_TIMEOUT_MS);
+					goto exit_channel;
+				}
 				continue;
 			} else if (nread < 0) break;
 		}
