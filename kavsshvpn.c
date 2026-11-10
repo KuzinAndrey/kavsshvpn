@@ -62,6 +62,7 @@ History:
 #include <linux/if_tun.h>
 #include <linux/tcp.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 
 #include <libssh2.h>
 
@@ -143,7 +144,7 @@ int down_tun_iface(struct tun_connection *conn) {
 ///////////////////////////////////////////////////////
 struct ssh_session {
 	libssh2_socket_t sock;
-	struct sockaddr_in sin;
+	struct sockaddr_storage sin;
 	char *user;
 	char *pubkey;
 	char *privkey;
@@ -207,33 +208,50 @@ int up_ssh_session(struct ssh_session *sess) {
 		goto return_error;
 	}
 
-	sess->sin.sin_family = AF_INET;
-	sess->sin.sin_addr.s_addr = inet_addr(sess->server_ip);
-	if (INADDR_NONE == sess->sin.sin_addr.s_addr) {
-		fprintf(stderr,"Can't parse server ip \"%s\" for ssh session\n", sess->server_ip);
-		goto return_error;
-	}
-
-	sess->sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (sess->sock == LIBSSH2_INVALID_SOCKET) {
-		fprintf(stderr,"Can't create socket for ssh session\n");
-		goto return_error;
-	}
-
-	// Detect silently dropped connections: fail after 90s of unacked data
-	// instead of waiting for the TCP retransmission timeout (~15-30 min).
 	{
-		int user_timeout_ms = 90 * 1000;
-		setsockopt(sess->sock, IPPROTO_TCP, TCP_USER_TIMEOUT,
-			&user_timeout_ms, sizeof(user_timeout_ms));
-	}
+		struct addrinfo hints = {0}, *res = NULL;
+		size_t addrlen;
+		char port_str[16];
+		int gai_rc;
 
-	sess->sin.sin_port = htons(sess->port);
-	if (connect(sess->sock, (struct sockaddr*)(&sess->sin), sizeof(struct sockaddr_in))) {
-		fprintf(stderr, "Can't make tcp connection to %s:%d - %s\n",
-			inet_ntoa(sess->sin.sin_addr), ntohs(sess->sin.sin_port),
-			strerror(errno));
-		goto return_error;
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_STREAM;
+		hints.ai_protocol = IPPROTO_TCP;
+		snprintf(port_str, sizeof(port_str), "%d", sess->port);
+		gai_rc = getaddrinfo(sess->server_ip, port_str, &hints, &res);
+		if (gai_rc != 0) {
+			fprintf(stderr, "Can't resolve server host \"%s\": %s\n",
+				sess->server_ip, gai_strerror(gai_rc));
+			goto return_error;
+		}
+
+		addrlen = res->ai_addrlen;
+		memcpy(&sess->sin, res->ai_addr, addrlen);
+		sess->sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+		freeaddrinfo(res);
+		if (sess->sock == LIBSSH2_INVALID_SOCKET) {
+			fprintf(stderr, "Can't create socket for ssh session\n");
+			goto return_error;
+		}
+
+		{
+			int user_timeout_ms = 90 * 1000;
+			setsockopt(sess->sock, IPPROTO_TCP, TCP_USER_TIMEOUT,
+				&user_timeout_ms, sizeof(user_timeout_ms));
+		}
+
+		if (connect(sess->sock, (struct sockaddr *)&sess->sin, addrlen)) {
+			char ip_str[INET6_ADDRSTRLEN];
+			const void *addr;
+			if (sess->sin.ss_family == AF_INET)
+				addr = &((struct sockaddr_in *)&sess->sin)->sin_addr;
+			else
+				addr = &((struct sockaddr_in6 *)&sess->sin)->sin6_addr;
+			inet_ntop(sess->sin.ss_family, addr, ip_str, sizeof(ip_str));
+			fprintf(stderr, "Can't make tcp connection to %s:%d - %s\n",
+				ip_str, sess->port, strerror(errno));
+			goto return_error;
+		}
 	}
 
 	sess->session = libssh2_session_init();
@@ -1027,7 +1045,7 @@ void print_help(const char *prog) {
 	printf("\t-q - work as tunnel (without iptables rules)\n");
 	printf("\t-i - invert roles (client in forwarding mode)\n");
 	printf("\t-n <subnet> - tun p-t-p /30 subnet (example: 10.254.254.0)\n");
-	printf("\t-H <ip> - ssh host (example: 181.67.121.32)\n");
+	printf("\t-H <host> - ssh host (IP or hostname, example: 181.67.121.32)\n");
 	printf("\t-P <port> - ssh port (default 22)\n");
 	printf("\t-u <user> - ssh user (default root)\n");
 	printf("\t-o <password> - password for ssh auth\n");
