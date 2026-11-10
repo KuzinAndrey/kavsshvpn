@@ -477,6 +477,10 @@ const char *session_start_sign = "ReAdy-SeT-Go!\n";
 struct tun_connection tc = {0};
 struct ssh_session sshconn = {0};
 
+// Our own name (basename of /proc/self/exe), set in main(). Used for the pidfile
+// and the stale-process check instead of hardcoding it.
+char prog_name[64] = "kavsshvpn";
+
 char *tun_buffer = NULL;
 size_t tun_buffer_size = 32 << 10;
 char *channel_buffer = NULL;
@@ -1159,6 +1163,21 @@ char *escape_for_shell(const char *input) {
 int main(int argc, char **argv) {
 	int rc = 0;
 
+	// Remember our own name (basename of /proc/self/exe) so the pidfile and the
+	// stale-process check don't hardcode it. Falls back to the default if the
+	// readlink fails.
+	{
+		char exe_path[512];
+		ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+		if (n > 0) {
+			exe_path[n] = '\0';
+			const char *base = strrchr(exe_path, '/');
+			base = base ? base + 1 : exe_path;
+			strncpy(prog_name, base, sizeof(prog_name) - 1);
+			prog_name[sizeof(prog_name) - 1] = '\0';
+		}
+	}
+
 	// Parse program options
 	int opt = 0;
 	while ( (opt = getopt(argc, argv, "hfscqin:H:P:u:o:a:b:dx:rw:t:e:l")) != -1)
@@ -1349,7 +1368,7 @@ int main(int argc, char **argv) {
 		char pidpath[128] = {0};
 		char procpath[128] = {0};
 		char cmdline[1024] = {0};
-		snprintf(pidpath, sizeof(pidpath), "/run/kavsshvpn_%s", inet_ntoa(local_ptp_ip));
+		snprintf(pidpath, sizeof(pidpath), "/run/%s_%s", prog_name, inet_ntoa(local_ptp_ip));
 		fpid = fopen(pidpath, "r");
 		if (fpid) {
 			pid_t killpid = 0;
@@ -1362,7 +1381,7 @@ int main(int argc, char **argv) {
 					size_t nread = fread(cmdline, 1, sizeof(cmdline) - 1, fcl);
 					fclose(fcl);
 					cmdline[nread] = '\0';
-					if (strstr(cmdline, "kavsshvpn")) {
+					if (strstr(cmdline, prog_name)) {
 						kill(killpid, SIGKILL);
 						syslog(LOG_INFO, "Killed staled client process %d", (int)killpid);
 						sleep(2);
