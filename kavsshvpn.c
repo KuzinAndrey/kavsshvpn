@@ -1203,12 +1203,15 @@ char *escape_for_shell(const char *input) {
 static char g_pidfile_path[128] = {0};
 
 // Kill a stale process holding this slot, then record our PID.
-static void pidfile_guard(struct in_addr local_ptp_ip) {
+static void pidfile_guard(struct in_addr local_ptp_ip, int refresh) {
 	FILE *fpid = NULL;
 	char procpath[128] = {0};
 	char cmdline[1024] = {0};
 	snprintf(g_pidfile_path, sizeof(g_pidfile_path), "/run/%s_%s",
 		prog_name, inet_ntoa(local_ptp_ip));
+
+	if (refresh) goto write_pid;
+
 	fpid = fopen(g_pidfile_path, "r");
 	if (fpid) {
 		pid_t killpid = 0;
@@ -1230,6 +1233,8 @@ static void pidfile_guard(struct in_addr local_ptp_ip) {
 		}
 		fclose(fpid);
 	}
+
+write_pid:
 	fpid = fopen(g_pidfile_path, "w");
 	if (fpid) {
 		fprintf(fpid, "%d\n", getpid());
@@ -1438,7 +1443,7 @@ int main(int argc, char **argv) {
 	};
 
 	// Kill any stale process for this slot, then record our PID.
-	pidfile_guard(local_ptp_ip);
+	pidfile_guard(local_ptp_ip, 0);
 
 	char tun_iface[IFNAMSIZ];
 	int tun_number = 1;
@@ -1696,6 +1701,7 @@ retry_ssh_server:
 			fprintf(stderr,"Can't daemonize process!\n");
 			goto exit_iptables;
 		};
+		pidfile_guard(local_ptp_ip, 1);
 	} else {
 		fprintf(stderr,"Work in foreground mode (press Ctrl+C for break)\n");
 	}
