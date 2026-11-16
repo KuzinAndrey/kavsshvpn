@@ -83,7 +83,7 @@ History:
 #define SLEEP_TRY 10
 #define MAX_WAIT_RETRY 60 // ~1.1s per wait, ~66s max for handshake/auth/exec
 
-volatile sig_atomic_t program_state = 0; // 2 - exit
+volatile sig_atomic_t program_state = 0; // 0 - unknown, 1 - work, 2 - restart, 3 - exit
 int run_command(const char *fmt, ...);
 
 ///////////////////////////////////////////////////////
@@ -466,6 +466,9 @@ defer:
 void signal_handler(int sig) {
 	syslog(LOG_INFO,"catch signal %d", sig);
 	switch (sig) {
+		case SIGHUP:
+			program_state = 2; // restart
+		break;
 		case SIGINT:
 		case SIGTERM:
 			program_state = 3; //exit main cycle
