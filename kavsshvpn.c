@@ -967,8 +967,10 @@ int server_work(struct tun_connection *conn, struct ssh_session *sess) {
 				}
 			} else if (n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
 				break;
-			} else if (n < 0) return -__LINE__;
-			else {
+			} else if (n < 0) {
+				syslog(LOG_ERR, "%s return %ld", "libssh2_channel_read", n);
+				return -__LINE__;
+			} else {
 				channel_state_pos += n;
 				icmp_liveness_data(&icmp_lv);
 				if (sizeof(channel_packet_size) - channel_state_pos == 0) {
